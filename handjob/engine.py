@@ -100,17 +100,20 @@ class _CamReader(threading.Thread):
         self._slot = None            # (t_read, frame) — newest
         self._seq = 0
         self._fail_since = None      # wall time since the driver started failing reads
-        self._stop = threading.Event()
+        # NOT "_stop": threading.Thread uses self._stop() internally in join()
+        # once the thread has finished — an attribute with that name makes any
+        # later join() die with "'Event' object is not callable".
+        self._abort = threading.Event()
 
     def run(self):
         cap = self.cap
-        while not self._stop.is_set():
+        while not self._abort.is_set():
             t0 = time.time()
             try:
                 ok, frame = cap.read()
             except Exception:
                 ok, frame = False, None
-            if self._stop.is_set():
+            if self._abort.is_set():
                 break
             with self._cv:
                 if ok:
@@ -138,7 +141,7 @@ class _CamReader(threading.Thread):
         (frame=None means the driver reported a failed read)."""
         with self._cv:
             self._cv.wait_for(
-                lambda: self._seq != last_seq or self._fail_since is not None or self._stop.is_set(),
+                lambda: self._seq != last_seq or self._fail_since is not None or self._abort.is_set(),
                 timeout=timeout)
             if self._seq != last_seq:
                 return self._seq, self._slot[0], self._slot[1]
@@ -147,7 +150,7 @@ class _CamReader(threading.Thread):
             return None
 
     def abandon(self):
-        self._stop.set()
+        self._abort.set()
         with self._cv:
             self._cv.notify_all()
 
@@ -1006,10 +1009,15 @@ class Engine(threading.Thread):
             # CPU work on a repeating camera. Real cameras never repeat exactly
             # (sensor noise), so this only fires for duplicates.
             if self._dedupe and sig is not None and _is_dup_sig(sig, self._last_proc_sig):
-                spent = time.perf_counter() - t_read
-                budget = 1.0 / self._target_fps
-                if spent < budget:            # vcams answer instantly: don't spin the core
-                    time.sleep(budget - spent)
+                # pace against t_read (a WALL clock) — mixing perf_counter with
+                # t_read here once slept for ~56 years: budget - (perf_counter -
+                # time.time()) is a ~1.7e9-positive number, so the engine froze
+                # on the first repeated frame (any static scene on a vcam).
+                wait = budget_dup = 1.0 / self._target_fps
+                spent = time.time() - t_read
+                wait -= spent
+                if wait > 0:                  # vcams answer instantly: don't spin
+                    time.sleep(min(wait, budget_dup))
                 continue
             self._last_proc_sig = sig
 

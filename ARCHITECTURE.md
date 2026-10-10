@@ -223,3 +223,24 @@ where the third-party pipeline finds the hand but ours locks the shadow
 region) — the landmark stage itself is exact once locked; multi-hand and
 custom models use the CPU engine. Default `backend: "auto"` keeps the
 verified CPU path one dropdown away.
+
+---
+
+## 15. 2.5.1 — duplicate-frame gate freeze (the real "camera freezes" bug)
+
+Symptom: camera opens, first frame processes, then the app freezes forever
+(frozen preview, no tracking, no error, no watchdog output). Trigger: any
+camera that REPEATS a frame — which virtual cams (Camo/Broadcast) do on every
+static scene. Cause: 2.4.4's duplicate-frame gate paced with
+`spent = time.perf_counter() - t_read` where `t_read` is a **wall clock**
+(`time.time()`): that difference is ≈ −1.76e9, so `time.sleep(budget - spent)`
+slept ~56 YEARS on the first duplicate. The engine thread was parked before it
+could ever reach any watchdog. Probes stayed green because their synthetic
+feeds skip the gate (`_dedupe` off for injected captures) — this is exactly
+the class of bug end-to-end feeds must cover.
+
+Fix: pace against `time.time()` (same clock as `t_read`) and clamp the sleep
+to one frame budget. Regression cover: `test_engine_survives_repeated_frames`
+(unit) + the `--probe` stage "duplicate-frame handling (repeated feed)"
+(a feed where every 3rd read is new — the engine must process ≥4 frames in
+8 s; the bug made this hang/never progress).

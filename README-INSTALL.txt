@@ -1,9 +1,9 @@
 HandJob3000 — hand-gesture mouse control for Windows
 ======================================================
-Version 2.5.0  (x64, Windows 10/11)
+Version 2.5.1  (x64, Windows 10/11)
 
 INSTALL
-  1. Double-click  HandJob3000-Setup-2.5.0.exe
+  1. Double-click  HandJob3000-Setup-2.5.1.exe
   2. No administrator rights needed — it installs for the current user only
      (default: %LOCALAPPDATA%\Programs\HandJob3000, desktop shortcut optional).
   3. Launch HandJob3000 from the desktop or Start menu.
@@ -35,6 +35,16 @@ QUICK START
 
   The preview shows only the hand wireframe by default (no camera image).
   Switch it in the Camera card: Wireframe / Camera / Off.
+
+WHAT'S NEW IN 2.5.1
+  * Fixed the freeze on virtual cameras: a bug in the duplicate-frame handler
+    (added in 2.4.4) could put the engine to sleep indefinitely the moment a
+    camera repeated a frame — which virtual cameras (Camo, NVIDIA Broadcast)
+    do constantly whenever the scene is still. The result was a frozen
+    preview and no tracking with no error shown. Fixed, with a regression
+    test and a new probe stage that feeds the engine a repeating camera
+    pattern. If the app ever says "camera busy", another app (Discord,
+    NVIDIA Broadcast, OBS) is holding the camera — close it and reopen.
 
 WHAT'S NEW IN 2.5.0
   * GPU inference engine (experimental): a second inference backend runs the

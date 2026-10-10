@@ -1500,6 +1500,90 @@ def test_backend_selection_and_wiring():
     assert 'backend_now = str(cfg.get("backend")' in src  # live switch in the loop
 
 
+def test_engine_survives_repeated_frames():
+    """2.5.1 regression: a REPEATING feed (static scene on a virtual cam) must
+    not stall the engine. A clock mix in the duplicate-frame gate once made it
+    sleep ~1.7e9 s (perf_counter - wall-clock) on the first repeated frame:
+    real cameras froze instantly, while probes (synthetic feeds skip the gate)
+    stayed green."""
+    import time as _t
+    import types
+    import numpy as np
+    import handjob.engine as engmod
+    from handjob.engine import Engine, CursorBus
+
+    class RepeatFeed:
+        """Every 3rd read is new; the others repeat — vcam behavior."""
+        def __init__(self):
+            self.n = 0
+
+        def isOpened(self):
+            return True
+
+        def read(self):
+            self.n += 1
+            frame = np.zeros((48, 64, 3), dtype=np.uint8)
+            k = (self.n // 3) % 32
+            frame[8:16, k:k + 8] = 200
+            return True, frame
+
+        def set(self, *a):
+            pass
+
+        def release(self):
+            pass
+
+    class FakeLM:
+        def detect_for_video(self, img, ts):
+            return types.SimpleNamespace(hand_landmarks=[], hand_world_landmarks=None)
+        def close(self):
+            pass
+
+    bus = CursorBus()
+    eng = Engine(bus)
+    eng._load_model = lambda: setattr(eng, "landmarker", FakeLM())
+    eng.capture = RepeatFeed()
+    eng._dedupe = True           # force the duplicate gate on (injected feeds skip it)
+    try:
+        eng.start()
+        deadline = _t.time() + 8
+        while _t.time() < deadline and bus.frames < 4:
+            _t.sleep(0.1)
+        eng.stop()
+        assert bus.frames >= 4, \
+            f"duplicate-frame gate stalled the engine ({bus.frames} frames in 8s)"
+    finally:
+        try:
+            eng.cleanup()
+        except Exception:
+            pass
+
+
+def test_cam_reader_join_after_exit():
+    """2.5.1 regression: joining a reader that already exited must not raise.
+    _CamReader used to store its stop flag as `self._stop`, shadowing
+    threading.Thread._stop() — which join() calls internally once the thread
+    has finished — so the engine crashed ('Event' object is not callable)
+    whenever it joined an already-exited reader (the camera-switch path)."""
+    import time as _t
+    import numpy as np
+    from handjob.engine import _CamReader
+
+    class Cap:
+        def read(self):
+            _t.sleep(0.01)
+            return True, np.zeros((4, 4, 3), dtype=np.uint8)
+        def release(self):
+            pass
+
+    r = _CamReader(Cap(), max_hz=1000)
+    r.start()
+    _t.sleep(0.05)
+    r.abandon()
+    r.join(timeout=2.0)          # must not raise TypeError
+    assert not r.is_alive()
+
+
 def test_settings_21_keys():
     """New 2.1 settings clamp correctly (choices, ranges, bools)."""
     from handjob import settings as S

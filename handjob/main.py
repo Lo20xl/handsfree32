@@ -573,6 +573,49 @@ def run_probe(seconds=3.0):
         print(f"  frames={frames} in {seconds:.0f}s  fps={fps:.1f} latency={lat:.1f}ms")
     check(f"engine loop ({seconds:.0f}s, synthetic feed)", engine_rt)
 
+    def engine_dup_rt():
+        """2.5.1: a REPEATING feed (what a static scene on a virtual cam does)
+        must not stall the engine — the duplicate-frame gate once slept
+        ~forever on the first repeated frame due to a clock mix."""
+        import numpy as _np
+
+        class _RepeatFeed:
+            def __init__(self):
+                self.n = 0
+
+            def isOpened(self):
+                return True
+
+            def read(self):
+                self.n += 1
+                frame = _np.zeros((48, 64, 3), dtype=_np.uint8)
+                k = (self.n // 3) % 32
+                frame[8:16, k:k + 8] = 200
+                return True, frame
+
+            def set(self, *a):
+                pass
+
+            def release(self):
+                pass
+
+        bus2 = CursorBus()
+        eng2 = Engine(bus2)
+        eng2.capture = _RepeatFeed()
+        eng2._dedupe = True                  # force the duplicate gate on
+        eng2.start()
+        t0 = _t.time()
+        while _t.time() - t0 < 8 and bus2.frames < 4 and not bus2.error:
+            _t.sleep(0.2)
+        eng2.stop()
+        eng2.cleanup()
+        if bus2.error:
+            raise RuntimeError(bus2.error)
+        if bus2.frames < 4:
+            raise RuntimeError(f"duplicate-frame gate stalled the engine ({bus2.frames} frames in 8s)")
+        print(f"  repeated feed survived: {bus2.frames} frames processed")
+    check("duplicate-frame handling (repeated feed)", engine_dup_rt)
+
     print(f"PROBE OK {len(ok)} ok, {len(fail)} failed" if not fail
           else "PROBE FAIL " + "; ".join(fail))
     return 0 if not fail else 1
