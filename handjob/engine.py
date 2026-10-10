@@ -26,9 +26,6 @@ from collections import deque
 
 import cv2
 import numpy as np
-from mediapipe import Image as MpImage, ImageFormat
-from mediapipe.tasks import python as mp_python
-from mediapipe.tasks.python import vision
 
 from . import gestures as G
 from . import input_win32 as wi
@@ -199,6 +196,11 @@ def _task_path(name) -> str:
 
 
 def _landmarker_options(path, hands):
+    # imported lazily: mediapipe pulls matplotlib (~2 s of startup) and is only
+    # needed when the MediaPipe backend actually loads — the ONNX/GPU backend
+    # never touches it.
+    from mediapipe.tasks import python as mp_python
+    from mediapipe.tasks.python import vision
     return vision.HandLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=path),
         running_mode=vision.RunningMode.VIDEO,
@@ -226,6 +228,7 @@ def list_models():
 
 def validate_model(path) -> bool:
     """Load the file as a hand landmarker to prove it works; raises on failure."""
+    from mediapipe.tasks.python import vision
     lm = vision.HandLandmarker.create_from_options(_landmarker_options(path, 1))
     lm.close()
     return True
@@ -420,6 +423,7 @@ class Engine(threading.Thread):
         self._model_seen = str(settings.get("model_file") or "")   # live model switching
         self._backend_seen = str(settings.get("backend") or "auto")  # live backend switching
         self._backend_name = "mediapipe"                             # what _load_model picked
+        self._mp_image_cls = None       # set when the mediapipe backend loads (lazy import)
         self._uniq_check_t = 0.0        # unique-frame watchdog state
         self._uniq_reopen_t = 0.0
         self._uniq_bad_streak = 0
@@ -476,7 +480,7 @@ class Engine(threading.Thread):
         self._stop.set()
 
     # -- lifecycle -----------------------------------------------------------
-    def _open_camera(self, index):
+    def _open_camera(self, index, use_cache=True):
         """Open the camera at the highest mode that actually DELIVERS the rate.
 
         The decision is MEASURED (frames actually read), not requested, and it
@@ -485,8 +489,26 @@ class Engine(threading.Thread):
         Camo/NVIDIA-Broadcast chain is mid-restart), so the probe must never
         take the app down with it. The processing downscale still happens in
         software in the engine loop.
-        """
+
+        Fast path: the mode this camera landed on last time is tried directly
+        (the full ladder boots a helper exe per rung, ~5-6 s of startup). The
+        delivered-rate watchdog re-measures with the full ladder when the
+        cached mode turns out to trickle."""
         fps = 60 if int(settings.get("capture_fps") or 0) >= 60 else 30
+        if use_cache:
+            cache = settings.get("cam_mode_cache") or {}
+            cand = cache.get(str(int(index)))
+            if isinstance(cand, (list, tuple)) and len(cand) == 2:
+                try:
+                    w, h = int(cand[0]), int(cand[1])
+                except (TypeError, ValueError):
+                    w = h = 0
+                if w > 0 and h > 0:
+                    cap = self._open_mode(index, w, h, fps)
+                    if cap is not None:
+                        self._cam_mode = (w, h)
+                        log.info("camera %s: using saved mode %sx%s", index, w, h)
+                        return cap
         order = [(CAPTURE_W, CAPTURE_H), (640, 480)]
         for w, h in order:
             measured = self._probe_capture_fps(index, w, h, fps, CAMERA_PROBE_S)
@@ -502,6 +524,12 @@ class Engine(threading.Thread):
                 if cap is None:
                     continue
                 self._cam_mode = (w, h)
+                try:
+                    cache = settings.get("cam_mode_cache") or {}
+                    cache[str(int(index))] = [int(w), int(h)]
+                    settings.set("cam_mode_cache", cache)
+                except Exception:
+                    pass
                 return cap
             log.info("camera %s: 720p trickles at %.1f fps -> trying 640x480", index, measured)
         return None
@@ -589,18 +617,18 @@ class Engine(threading.Thread):
             prev = sig
         return reads, uniq / span, None
 
-    def _open_with_retry(self, cam, attempts=15):
+    def _open_with_retry(self, cam, attempts=15, use_cache=True):
         cap = None
         tries = 0
         while cap is None and not self._stop.is_set() and tries < attempts:
-            cap = self._open_camera(int(cam))
+            cap = self._open_camera(int(cam), use_cache=use_cache)
             tries += 1
             if cap is None:
                 self.bus.error = f"camera {cam} busy — is another app using it?"
                 time.sleep(1.2)
         return cap
 
-    def _open_bounded(self, cam, deadline=None):
+    def _open_bounded(self, cam, deadline=None, use_cache=True):
         """`_open_with_retry` that can never block the engine for long: a wedged
         driver can hang VideoCapture()/the probe itself. On timeout the daemon
         helper is abandoned (if it later returns a capture, that handle is
@@ -609,7 +637,7 @@ class Engine(threading.Thread):
         box = {}
 
         def work():
-            box["cap"] = self._open_with_retry(cam)
+            box["cap"] = self._open_with_retry(cam, use_cache=use_cache)
 
         th = threading.Thread(target=work, daemon=True, name="HJ3-CamOpen")
         th.start()
@@ -660,7 +688,7 @@ class Engine(threading.Thread):
                     self._read_stalls, CAMERA_STALL_REOPENS)
         self._stop_reader()
         self.capture = None
-        cap = self._open_bounded(self._cam_index)
+        cap = self._open_bounded(self._cam_index, use_cache=False)   # re-measure after a stall
         if cap is None:
             self.bus.error = (f"camera {self._cam_index} open is not responding — the driver looks "
                               "stuck; click Refresh app")
@@ -673,9 +701,12 @@ class Engine(threading.Thread):
         log.info("camera %s reopened after stall", self._cam_index)
         return True
 
-    def request_camera(self, idx):
-        """Ask the engine thread to switch cameras on its next frame."""
-        self._cam_request = int(idx)
+    def request_camera(self, idx, use_cache=True):
+        """Ask the engine thread to switch cameras on its next frame.
+
+        use_cache=False forces the full 720p->640x480 measurement ladder even
+        when a cached mode exists (used when re-measuring after bad delivery)."""
+        self._cam_request = (int(idx), bool(use_cache))
 
     def request_driver_settings(self):
         """Open the camera driver's own property page (DirectShow). This is where
@@ -716,6 +747,9 @@ class Engine(threading.Thread):
             log.warning("model %s missing — falling back to the bundled default", path)
             settings.set("model_file", "")
             path = _task_path("")
+        from mediapipe import Image as MpImage, ImageFormat
+        from mediapipe.tasks.python import vision
+        self._mp_image_cls, self._mp_image_fmt = MpImage, ImageFormat
         self.landmarker = vision.HandLandmarker.create_from_options(
             _landmarker_options(path, hands))
         self._backend_name = "mediapipe"
@@ -730,13 +764,6 @@ class Engine(threading.Thread):
             self.bus.error = f"engine crashed: {e}"
 
     def _run(self):
-        try:
-            self._load_model()
-        except Exception as e:
-            log.error("model load failed: %s", e)
-            self.bus.error = f"model load failed: {e}"
-            return
-        log.info("model loaded: %s (num_hands=%s)", MODEL_NAME, self._hands_seen)
         fake = os.environ.get("HJ3_FAKE_CAM")
         if fake:
             img = cv2.imread(fake)
@@ -747,8 +774,26 @@ class Engine(threading.Thread):
                 log.warning("HJ3_FAKE_CAM=%s could not be read — falling back to camera", fake)
         cam = int(settings.get("camera_index"))
         self._cam_index = cam
+        cam_box = {}
+        cam_th = None
         if not (self.capture and self.capture.isOpened()):  # reuse a pre-opened capture (probe flow)
-            self.capture = self._open_bounded(cam)
+            # open the camera WHILE the model loads — the mode probe boots a
+            # helper exe per rung, and serialising it after the model cost
+            # several seconds of startup
+            def _boot_open():
+                cam_box["cap"] = self._open_bounded(cam)
+            cam_th = threading.Thread(target=_boot_open, daemon=True, name="HJ3-CamBoot")
+            cam_th.start()
+        try:
+            self._load_model()
+        except Exception as e:
+            log.error("model load failed: %s", e)
+            self.bus.error = f"model load failed: {e}"
+            return
+        log.info("model loaded: %s (num_hands=%s)", MODEL_NAME, self._hands_seen)
+        if cam_th is not None:
+            cam_th.join(timeout=CAMERA_OPEN_DEADLINE_S + 3)
+            self.capture = cam_box.get("cap")
             self._dedupe = self.capture is not None        # dup gate: real cams only (probe/fake feeds differ every frame)
         if self.capture is None:
             log.error("camera %s not available", cam)
@@ -779,10 +824,14 @@ class Engine(threading.Thread):
             req = self._cam_request
             if req is not None:
                 self._cam_request = None
+                if isinstance(req, tuple):
+                    req, req_use_cache = req
+                else:
+                    req_use_cache = True
                 log.info("camera switch requested -> %s", req)
                 self._stop_reader()
                 self.capture = None
-                self.capture = self._open_bounded(req)
+                self.capture = self._open_bounded(req, use_cache=req_use_cache)
                 if self.capture is None:
                     log.error("camera switch to %s failed", req)
                     self.bus.error = f"camera {req} unavailable"
@@ -848,11 +897,12 @@ class Engine(threading.Thread):
                 self._rate_check_frames = self._read_count
                 if 0.5 < rate < CAMERA_MIN_FPS and self._cam_mode != (640, 480):
                     self._rate_low_streak += 1
-                    if self._rate_low_streak >= 2 and wnow - self._rate_reopen_t > 90.0:
+                    need = 1 if rate < 5.0 else 2       # clearly trickling: act on the first window
+                    if self._rate_low_streak >= need and wnow - self._rate_reopen_t > 90.0:
                         self._rate_reopen_t = wnow
                         self._rate_low_streak = 0
                         log.warning("delivered rate %.1f fps — reopening camera to re-measure", rate)
-                        self.request_camera(self._cam_index)
+                        self.request_camera(self._cam_index, use_cache=False)
                 else:
                     self._rate_low_streak = 0
             # unique-frame watchdog: virtual cams and low-light auto-exposure
@@ -1033,9 +1083,12 @@ class Engine(threading.Thread):
                 frame = cv2.flip(frame, 1)  # selfie view: hand right = screen right
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 t_inf = time.perf_counter()
-                res = self.landmarker.detect_for_video(
-                    MpImage(image_format=ImageFormat.SRGB, data=rgb),
-                    int(t0 * 1000))
+                if self._mp_image_cls is not None:
+                    res = self.landmarker.detect_for_video(
+                        self._mp_image_cls(image_format=self._mp_image_fmt.SRGB, data=rgb),
+                        int(t0 * 1000))
+                else:
+                    res = self.landmarker.detect_for_video(rgb, int(t0 * 1000))
                 self._infer_ms = (time.perf_counter() - t_inf) * 1000.0
             except Exception:
                 consecutive_errors += 1

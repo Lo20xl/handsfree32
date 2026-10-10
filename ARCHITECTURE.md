@@ -244,3 +244,19 @@ to one frame budget. Regression cover: `test_engine_survives_repeated_frames`
 (unit) + the `--probe` stage "duplicate-frame handling (repeated feed)"
 (a feed where every 3rd read is new — the engine must process ≥4 frames in
 8 s; the bug made this hang/never progress).
+
+---
+
+## 16. 2.5.2 — startup & slow-camera recovery speedups
+
+Trigger: user report "camera startup is slow, freezes at boot, ~2 min to
+normal" — the log showed Camo trickling at 1 fps (its source app closed),
+then Broadcast frozen (dead source) until it recovered. The app survived all
+of it (the 2.5.1 fixes) but its own overhead made the bad phase worse.
+
+| Change | Why |
+|---|---|
+| Lazy mediapipe import (`engine.py`): the ONNX backend never imports mediapipe (which drags in matplotlib — the "generated new fontManager" line ≈ 2 s of frozen-exe startup). `MpImage` wrapping only happens on the mediapipe path (`self._mp_image_cls`). | Cuts ~2 s from every GPU-engine launch. |
+| `settings.cam_mode_cache` = `{index: [w,h]}`: the mode a camera last landed on is opened DIRECTLY on later launches. Full ladder re-measures only when the delivered-rate watchdog or a stall fires (`request_camera(..., use_cache=False)` / `_stall_recover`). | The ladder boots one helper exe per rung (frozen exe start ≈ 2-3 s each) — the cached path skips 5-6 s of most launches. |
+| Camera open runs on its own thread, overlapping `_load_model()` (joined before the loop starts). | The open and model load were serialised. |
+| Delivered-rate watchdog: one 3-s window is enough when rate < 5 fps (was 2). | Faster recovery from a trickling/vcam-waking source. |

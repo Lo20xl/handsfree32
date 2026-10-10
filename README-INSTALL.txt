@@ -1,9 +1,9 @@
 HandJob3000 — hand-gesture mouse control for Windows
 ======================================================
-Version 2.5.1  (x64, Windows 10/11)
+Version 2.5.2  (x64, Windows 10/11)
 
 INSTALL
-  1. Double-click  HandJob3000-Setup-2.5.1.exe
+  1. Double-click  HandJob3000-Setup-2.5.2.exe
   2. No administrator rights needed — it installs for the current user only
      (default: %LOCALAPPDATA%\Programs\HandJob3000, desktop shortcut optional).
   3. Launch HandJob3000 from the desktop or Start menu.
@@ -35,6 +35,17 @@ QUICK START
 
   The preview shows only the hand wireframe by default (no camera image).
   Switch it in the Camera card: Wireframe / Camera / Off.
+
+WHAT'S NEW IN 2.5.2
+  * Much faster startup and quicker recovery from sleepy cameras:
+      - The GPU engine no longer loads MediaPipe's plotting machinery at
+        start (about 2 s of startup saved), and the app opens the camera
+        while the engine loads instead of after it.
+      - The camera mode that worked last time is reused directly — the full
+        quality measurement only re-runs when something is actually off, so
+        normal launches skip several seconds of probing.
+      - If the camera trickles (e.g. a virtual camera whose source is still
+        waking up), the app re-measures it after ~3 s instead of ~6-9 s.
 
 WHAT'S NEW IN 2.5.1
   * Fixed the freeze on virtual cameras: a bug in the duplicate-frame handler

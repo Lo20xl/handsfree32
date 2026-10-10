@@ -1133,8 +1133,8 @@ def test_engine_read_stall_recovers():
     bus = CursorBus()
     eng = Engine(bus)
     eng._load_model = lambda: setattr(eng, "landmarker", FakeLM())
-    eng._open_bounded = lambda cam, deadline=None: (opens.append(cam),
-                                                    BlockingCap() if len(opens) == 1 else good)[1]
+    eng._open_bounded = lambda cam, deadline=None, use_cache=True: (
+        opens.append(cam), BlockingCap() if len(opens) == 1 else good)[1]
     old_stall = engmod.CAMERA_STALL_S
     engmod.CAMERA_STALL_S = 0.6
     try:
@@ -1161,7 +1161,7 @@ def test_engine_read_stall_wiring():
     src = open(engmod.__file__, encoding="utf-8").read()
     assert "self._reader.get(self._reader_seq" in src
     assert "_stall_decision(self._read_stalls, CAMERA_STALL_REOPENS)" in src
-    assert "self._open_bounded(cam)" in src and "self._open_bounded(req)" in src
+    assert "self._open_bounded(cam)" in src and "self._open_bounded(req" in src
     assert "self._stop_reader()" in src
     assert "ok, frame = self.capture.read()" not in src
 
@@ -1498,6 +1498,9 @@ def test_backend_selection_and_wiring():
     assert 'settings.get("backend")' in src
     assert "_backend_seen" in src
     assert 'backend_now = str(cfg.get("backend")' in src  # live switch in the loop
+    assert "cam_mode_cache" in src                        # camera-mode fast path
+    assert "from mediapipe import Image as MpImage" not in src.split("\n\n", 1)[0], \
+        "mediapipe must not import at module level (matplotlib costs ~2 s of startup)"
 
 
 def test_engine_survives_repeated_frames():

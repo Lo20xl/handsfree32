@@ -38,6 +38,8 @@ DEFAULTS = {
     # inference runtime: auto = ONNX-Runtime/DirectML GPU when available
     # (falls back to MediaPipe CPU), onnx = GPU only-path, mediapipe = CPU
     "backend": "auto",
+    # camera-index -> [w, h] last measured-good mode (skips the startup ladder)
+    "cam_mode_cache": {},
     # experimental sonar sensing (speaker+mic Doppler) — sensing only, no control
     "sonar_enabled": False,
     "sonar_in_device": -1,    # sounddevice index; -1 = system default input
