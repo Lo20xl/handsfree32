@@ -75,6 +75,28 @@ def _is_dup_sig(sig, prev) -> bool:
     return prev is not None and float(np.abs(sig - prev).mean()) <= SIG_EPS
 
 
+def _smooth_box(prev, box, kps, follow_ratio=0.25):
+    """Temporally smooth a palm detection (2.5.6).
+
+    The ONNX backend re-runs palm detection every frame; its box wanders by a
+    few pixels frame to frame, and since the landmark crop follows the box,
+    that noise becomes whole-hand common-mode jitter on the cursor. (The
+    reference MediaPipe pipeline reuses tracking rects between frames, so it
+    never inherits detector jitter.) An EMA with a jump gate: steady boxes are
+    smoothed (alpha .4); a jump bigger than `follow_ratio` of the box side
+    (lost hand, new hand, fast motion) is followed almost immediately."""
+    if prev is None:
+        return box, kps
+    pbox, pkps = prev
+    b = np.asarray(box, np.float32)
+    pb = np.asarray(pbox, np.float32)
+    k = np.asarray(kps, np.float32)
+    pk = np.asarray(pkps, np.float32)
+    jump = float(np.abs(b[:2] - pb[:2]).sum()) + float(abs(b[2] - pb[2]))
+    a = 0.85 if jump > follow_ratio * max(float(b[2]), 1.0) else 0.4
+    return tuple((pb + a * (b - pb)).tolist()), pk + a * (k - pk)
+
+
 def _stall_decision(stalls, max_reopens):
     """After `stalls` consecutive no-frame reopen attempts: what next?
 
@@ -177,18 +199,25 @@ def _frozen_cam_state(urate, streak):
     return 0, ("clear" if streak else "ok")
 CAMERA_PROBE_S = 0.6         # seconds of frames read to measure a fresh capture
 PRED_MIN_LEAD_S = 1.3        # prediction floor = 1.3 camera intervals
+PRED_LEAD_CAP_MS = 100.0     # ...capped: beyond this the lead overshoots on direction changes
 
 
 def _effective_prediction(slider_ms, dt) -> float:
     """Prediction to run with: the slider value, but never less than ~1.3
     camera intervals — at 30+ fps this is below the default 45 ms (slider
-    wins, unchanged), at ~10 fps feeds it scales to ~130 ms so the emitter
-    can interpolate across the whole gap instead of jumping per sample."""
+    wins, unchanged), at ~10 fps feeds it scales so the emitter can
+    interpolate across the whole gap instead of jumping per sample.
+
+    The dt-scaled floor is CAPPED (2.5.6): at very low unique rates (a dark
+    room, a slow virtual cam) 1.3 intervals ballooned to 300+ ms and the
+    cursor overshot and swung on every direction change — jitter, felt as
+    "it got worse". Past the cap, longer gaps are handled by the
+    stop-detection/retract path, not by ever-longer lead."""
     try:
         v = float(slider_ms or 0.0)
     except (TypeError, ValueError):
         v = 45.0
-    return max(v, PRED_MIN_LEAD_S * float(dt) * 1000.0)
+    return max(v, min(PRED_MIN_LEAD_S * float(dt) * 1000.0, PRED_LEAD_CAP_MS))
 
 
 # ---------------------------------------------------------------- models ----

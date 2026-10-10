@@ -296,3 +296,16 @@ Also: all camera probes now run from the agent's own terminal (cameras are
 accessible cross-session; only overlay/desktop checks need the interactive
 session) — probe helper editors no longer flash console windows on the user's
 desktop during normal diagnostics.
+
+---
+
+## 19. 2.5.6 — jitter on slow feeds (dark room / low unique rate)
+
+User: "jitters got worse". Measured live: the user's Camo at 23:13 delivered
+30.7 reads/s but only ~4 unique/s at brightness 14.5 (dark room) — and two
+app-side amplifiers were live:
+
+| Cause | Fix |
+|---|---|
+| `_effective_prediction` floor `max(slider, 1.3*interval)`: at 4 unique/s that is a **325 ms lead** — massive overshoot/swing on every direction change. The emitter's gap interpolation (`off = _extrap(sp, a, tau)`) already carries motion across gaps; the lead is only look-ahead. | Floor capped at `PRED_LEAD_CAP_MS = 100 ms` — 30+ fps behavior identical (43 ms < cap), 10 fps → 100, 4 fps → 100. Sliders above the cap still win. |
+| ONNX backend re-ran palm detection EVERY frame; the detector box wanders ±px and the landmark crop follows it → whole-hand common-mode jitter (MediaPipe's own pipeline reuses tracking rects; the port didn't). | `_smooth_box()` (engine): EMA α=0.4 on box+keypoints with a jump gate (jump > 25% of box side → α=0.85, snaps for lost/new-hand/fast motion); history kept across single misses. Wired in `hand_onnx.detect_for_video`. |

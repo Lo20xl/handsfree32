@@ -1,9 +1,9 @@
 HandJob3000 — hand-gesture mouse control for Windows
 ======================================================
-Version 2.5.5  (x64, Windows 10/11)
+Version 2.5.6  (x64, Windows 10/11)
 
 INSTALL
-  1. Double-click  HandJob3000-Setup-2.5.5.exe
+  1. Double-click  HandJob3000-Setup-2.5.6.exe
   2. No administrator rights needed — it installs for the current user only
      (default: %LOCALAPPDATA%\Programs\HandJob3000, desktop shortcut optional).
   3. Launch HandJob3000 from the desktop or Start menu.
@@ -35,6 +35,17 @@ QUICK START
 
   The preview shows only the hand wireframe by default (no camera image).
   Switch it in the Camera card: Wireframe / Camera / Off.
+
+WHAT'S NEW IN 2.5.6
+  * Jitter fixes for slow feeds (dark rooms / virtual cams delivering few new
+    frames per second):
+      - The look-ahead that hides camera latency used to balloon with low
+        update rates (up to 300+ ms), which made the cursor overshoot and
+        swing on every direction change. It is now capped — steady, no wobble.
+      - The GPU engine smooths the hand box across frames; re-finding it from
+        scratch every frame made the whole tracking inherit pixel-level
+        detector noise (a subtle extra jitter). Fix: box follows smoothly and
+        still snaps instantly when the hand moves fast or is lost.
 
 WHAT'S NEW IN 2.5.5
   * No more false "camera frozen" — the app no longer halts the cursor or

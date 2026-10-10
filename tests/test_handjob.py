@@ -1472,12 +1472,14 @@ def test_snapshot_hides_orb_without_hand():
 
 
 def test_effective_prediction_scales_with_dt():
-    """2.3: prediction never drops below ~1.4 camera intervals — at 30 fps the
-    slider value wins (unchanged feel); at ~10 fps feeds it scales up so the
-    emitter can interpolate across the gap instead of jumping per sample."""
-    from handjob.engine import _effective_prediction
+    """2.3 + 2.5.6: prediction never drops below ~1.3 camera intervals — at 30
+    fps the slider value wins (unchanged feel); at ~10 fps it scales up so the
+    emitter can interpolate across the gap; at very low rates the scaled floor
+    is CAPPED (300+ ms leads overshot and swung on direction changes)."""
+    from handjob.engine import _effective_prediction, PRED_LEAD_CAP_MS
     assert _effective_prediction(45, 1 / 30) == 45        # 30 fps: slider wins
-    assert abs(_effective_prediction(45, 1 / 10) - 130) < 1e-6   # 10 fps: scaled
+    assert _effective_prediction(45, 1 / 10) == PRED_LEAD_CAP_MS  # 10 fps: scaled then capped
+    assert _effective_prediction(45, 0.25) == PRED_LEAD_CAP_MS    # 4 fps: capped
     assert _effective_prediction(120, 1 / 30) == 120      # user value respected
 
 
@@ -1613,6 +1615,29 @@ def test_camera_diagnostics_permanent():
     # (~10/s) feed must not trigger the repeat reopen
     assert "OPEN-FIRST swap" in src
     assert "urate < 6.0 and urate < 0.45 * rrate" in src
+
+
+def test_pred_lead_cap_and_box_smoothing():
+    """2.5.6: the low-fps prediction floor is capped (at a few samples/s a
+    300+ ms lead made the cursor overshoot on every direction change) and the
+    ONNX backend temporally smooths its per-frame palm detections (the box
+    wander was becoming whole-cursor jitter)."""
+    import numpy as np
+    from handjob.engine import _effective_prediction, PRED_LEAD_CAP_MS, _smooth_box
+    assert abs(_effective_prediction(10, 1 / 30.0) - 43.33) < 0.1   # 30 fps: slider floor unchanged
+    assert _effective_prediction(10, 0.25) == PRED_LEAD_CAP_MS      # 4 fps: capped
+    assert _effective_prediction(120, 0.25) == 120                  # user slider wins
+    rng = np.random.default_rng(1)
+    prev = None
+    outs = []
+    for _ in range(60):
+        noisy = (100 + rng.normal(0, 3), 100 + rng.normal(0, 3), 50 + rng.normal(0, 2))
+        box, kps = _smooth_box(prev, noisy, np.zeros((7, 2), np.float32))
+        prev = (box, kps)
+        outs.append(box[0])
+    assert np.std(outs) < 2.2, f"steady box must be smoothed (std={np.std(outs):.2f})"
+    b2, _ = _smooth_box(prev, (160.0, 100.0, 50.0), np.zeros((7, 2), np.float32))
+    assert abs(b2[0] - 160.0) < 16.0, "a big jump must be followed almost immediately"
 
 
 def test_settings_21_keys():

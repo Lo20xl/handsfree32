@@ -251,9 +251,13 @@ class OnnxHandLandmarker:
 
         det = self._palm_detect(frame)
         if det is None:
-            self._last_rect = None
             return _Result([], None, 0.0, 0.0)
         score, box, kps = det
+        # keep the box steady across frames (2.5.6) — re-detecting every frame
+        # made the landmark crop inherit the detector's pixel-level wander,
+        # which reads as whole-cursor jitter
+        from .engine import _smooth_box
+        box, kps = _smooth_box(self._last_rect, box, kps)
         crop, m = self._crop(frame, box, kps)
         outs = self._landmark(crop)
         lm = outs[0][0].astype(np.float64)          # [63] crop-normalized 0..1
