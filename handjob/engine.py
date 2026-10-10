@@ -50,9 +50,9 @@ CAMERA_OPEN_DEADLINE_S = 12.0  # a wedged driver can hang VideoCapture() itself
 CAMERA_MIN_FPS = 12.0        # delivered fps below this = driver trickle mode
 FROZEN_UNIQUE_FPS = 2.0      # at/below this the source is frozen, not merely slow
 FROZEN_ERR = ("camera frozen — same frame repeating, ~0 new frames/s. Virtual cameras "
-              "(NVIDIA Broadcast, Camo, OBS) do this when their source app is closed or a "
-              "phone is disconnected: pick a live camera in the Camera dropdown or fix the "
-              "source, then click Refresh app")
+              "(NVIDIA Broadcast, Camo, OBS) do this when their source app is closed, "
+              "PAUSED, or a phone is disconnected: pick a live camera in the Camera "
+              "dropdown or fix the source (unpause / reconnect), then click Refresh app")
 SIG_EPS = 0.35                # 16x16 mean-abs diff at/below this = the same frame
 
 
@@ -920,9 +920,12 @@ class Engine(threading.Thread):
                         if self._slow_cam_streak >= 2 and not self.bus.warning:
                             if rrate > 40.0:
                                 # answers reads instantly + few new frames = virtual cam
-                                self.bus.warning = (f"camera delivers only ~{urate:.0f} new frames/s — it keeps "
-                                                    "re-sending the same frame. Check the virtual camera's source app "
-                                                    "(Camo / NVIDIA Broadcast / OBS) is live, or pick a directly "
+                                self.bus.warning = (f"camera answers {rrate:.0f} reads/s but sends the SAME "
+                                                    f"image every time (~{urate:.0f} new frames/s) — a readout of "
+                                                    "60 fps only means the driver answers, not that the picture "
+                                                    "changes. The source isn't delivering video: unpause / reconnect "
+                                                    "it (Camo, NVIDIA Broadcast, OBS — a paused or disconnected "
+                                                    "phone shows a still standby screen), or pick a directly "
                                                     "connected camera")
                             else:
                                 self.bus.warning = (f"camera delivers only ~{urate:.0f} new frames/s (tracking can't be "
