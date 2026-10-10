@@ -1028,6 +1028,144 @@ def test_dup_frame_gate():
     assert "self._dedupe = self.capture is not None" in src
 
 
+# ------------------------------------------- 2.4.5 engine: blocking-read stall ----
+def test_stall_decision_policy():
+    from handjob.engine import _stall_decision, CAMERA_STALL_REOPENS
+    assert _stall_decision(1, CAMERA_STALL_REOPENS) == "reopen"
+    assert _stall_decision(CAMERA_STALL_REOPENS, CAMERA_STALL_REOPENS) == "reopen"
+    assert _stall_decision(CAMERA_STALL_REOPENS + 1, CAMERA_STALL_REOPENS) == "give_up"
+
+
+def test_cam_reader_times_out_not_hangs():
+    """A driver-blocked read() must surface as a get() timeout, not a hang:
+    observed live — the NVIDIA Broadcast chain accepted the capture and then
+    never returned from read(), wedging the whole engine while the UI lived on."""
+    import time as _t
+    import numpy as np
+    from handjob.engine import _CamReader
+
+    class Cap:
+        def __init__(self):
+            self.n = 0
+
+        def read(self):
+            self.n += 1
+            if self.n <= 2:
+                return True, np.zeros((4, 4, 3), dtype=np.uint8)
+            _t.sleep(3600)            # driver never returns
+        def release(self):
+            pass
+
+    r = _CamReader(Cap(), max_hz=1000)
+    r.start()
+    got = 0
+    seq = 0
+    for _ in range(50):
+        item = r.get(seq, 0.1)
+        if item is None:
+            break
+        seq = item[0]
+        if item[2] is not None:
+            got += 1
+    assert got >= 2, got
+    t0 = _t.time()
+    assert r.get(seq, 0.2) is None, "blocked read must time out, not hang"
+    assert _t.time() - t0 < 1.0
+    r.abandon()
+
+
+def test_engine_read_stall_recovers():
+    """End of the engine loop: with a camera that blocks after its first frame,
+    the engine must abandon the stuck reader, reopen, and keep processing."""
+    import time as _t
+    import types
+    import numpy as np
+    import handjob.engine as engmod
+    from handjob.engine import Engine, CursorBus
+
+    class BlockingCap:
+        def __init__(self):
+            self.n = 0
+
+        def isOpened(self):
+            return True
+
+        def read(self):
+            self.n += 1
+            if self.n == 1:
+                img = np.zeros((48, 64, 3), dtype=np.uint8)
+                img[8:16, 4:12] = 200
+                return True, img
+            _t.sleep(3600)            # driver never returns
+        def set(self, *a):
+            pass
+        def release(self):
+            pass
+
+    class GoodCap:
+        def __init__(self):
+            self.frames = 0
+
+        def isOpened(self):
+            return True
+
+        def read(self):
+            self.frames += 1
+            _t.sleep(1 / 60.0)
+            img = np.zeros((48, 64, 3), dtype=np.uint8)
+            k = self.frames % 40           # moving block: frames must differ (dup gate)
+            img[8:16, k:k + 8] = 200
+            return True, img
+        def set(self, *a):
+            pass
+        def release(self):
+            pass
+
+    class FakeLM:
+        def detect_for_video(self, img, ts):
+            return types.SimpleNamespace(hand_landmarks=[], hand_world_landmarks=None)
+        def close(self):
+            pass
+
+    good = GoodCap()
+    opens = []
+
+    bus = CursorBus()
+    eng = Engine(bus)
+    eng._load_model = lambda: setattr(eng, "landmarker", FakeLM())
+    eng._open_bounded = lambda cam, deadline=None: (opens.append(cam),
+                                                    BlockingCap() if len(opens) == 1 else good)[1]
+    old_stall = engmod.CAMERA_STALL_S
+    engmod.CAMERA_STALL_S = 0.6
+    try:
+        eng.start()
+        deadline = _t.time() + 10
+        while _t.time() < deadline and bus.frames < 5:
+            _t.sleep(0.1)
+        eng.stop()
+        assert len(opens) >= 2, f"engine must reopen after a blocked read (opens={len(opens)})"
+        assert good.frames > 0, "the reopened camera must deliver frames"
+        assert bus.frames >= 5, f"engine must keep processing after recovery (frames={bus.frames})"
+    finally:
+        engmod.CAMERA_STALL_S = old_stall
+        try:
+            eng.cleanup()
+        except Exception:
+            pass
+
+
+def test_engine_read_stall_wiring():
+    """The engine loop consumes frames from the reader thread; the old direct
+    capture.read() (which a wedged driver could block forever) must be gone."""
+    import handjob.engine as engmod
+    src = open(engmod.__file__, encoding="utf-8").read()
+    assert "self._reader.get(self._reader_seq" in src
+    assert "_stall_decision(self._read_stalls, CAMERA_STALL_REOPENS)" in src
+    assert "self._open_bounded(cam)" in src and "self._open_bounded(req)" in src
+    assert "self._stop_reader()" in src
+    assert "ok, frame = self.capture.read()" not in src
+
+
 # --------------------------------------------------------- win32 constants ---
 def test_win32_module_imports():
     from handjob import input_win32 as wi

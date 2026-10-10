@@ -170,3 +170,32 @@ The user's log: `camera unique-frame rate 8.5 of 54.7 reads/s`.
 Harness numbers (`build/tune_repeats.py`: 55 reads/s + 15 unique/s synthetic
 camera, 200 px/s glide, 3 seeds): step-CV **2.49 → 1.11** (2.2× steadier
 per-tick advance), RMSE-optimal lag **93 → 79 ms**, RMSE **9.0 → 6.8 px**.
+
+---
+
+## 13. 2.4.5 — blocking-read stall guard (the "app froze / cameras look broken" fix)
+
+Symptom: the app opened a camera and then silently froze — preview stuck, no
+tracking, but the window still responsive and no error shown. Found live twice
+in one session: after opening camera 0 (Camo, mid-restart) and after switching
+to camera 1 (NVIDIA Broadcast with a wedged driver — VCAMDS spamming
+"NvMxnCltShmConsumer Init Failed. Err: -610"). Root cause: the engine loop
+called `capture.read()` directly, and a virtual-camera driver in a bad state
+accepts the open, delivers one frame, then **never returns from the next
+read()**. The engine thread sat inside the driver call — where no in-loop
+watchdog can run — so stall detection, the unique-frame watchdog, beats and
+error surfacing all stayed silent, forever. Closing the app could hang too
+(release() on a wedged handle).
+
+| Cause found | Fix |
+|---|---|
+| `capture.read()` on the engine thread can block forever in a wedged driver | New `_CamReader` thread owns the capture: it reads in a loop into a single newest-wins slot (paced to 1.5× target fps so instant-answering vcams can't spin a core). The engine loop waits on `get(seq, timeout)` — a blocked read now surfaces as a **timeout**. The reader is a daemon: an abandoned stuck read can never block app exit. |
+| Nothing could recover from a silent feed | **Read-stall watchdog**: NO frames for `CAMERA_STALL_S` (4 s) → abandon the stuck reader, reopen bounded (`_open_bounded` — the open itself can hang in the driver; daemon + 12 s deadline), keep going. `_stall_decision` gives up after `CAMERA_STALL_REOPENS` (3) consecutive stalls with a clear UI error ("camera keeps going silent — the driver looks stuck…"); a healthy 60 s re-arms the budget. |
+| App exit could block on `release()` of a wedged camera | `cleanup()` never releases inline; the reader owns release (runs in its own thread), reader-less captures release in a daemon. |
+| Camera-switch failure left `capture=None` and relied on read() to raise | Switch path now uses `_stop_reader` + `_open_bounded`; a failed switch is picked up by the stall watchdog. |
+
+Tests: `test_cam_reader_times_out_not_hangs`, `test_engine_read_stall_recovers`
+(full `_run` with a capture that blocks forever after frame 1 — the engine must
+abandon it, reopen and keep processing; the log shows "no frames for 0.8s —
+reopening (stall 1/3)"), `test_stall_decision_policy`,
+`test_engine_read_stall_wiring`.

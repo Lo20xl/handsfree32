@@ -48,9 +48,10 @@ camera → landmark stabilizer (adaptive 1€ filter + spike gate + palm guard)
   that keeps a still hand rock-steady with zero added lag in motion.
 - **Dedicated emitter thread** (high priority, 144 Hz) owns all cursor moves;
   the overlay draws in lock-step with it (dirty-rect layered window).
-- **Watchdogs**: camera stall → reopen; frozen virtual cam (source died) →
-  cursor halts + a clear message; dim-light/repeat-frame warnings; Ctrl+Alt+H
-  panic stop.
+- **Watchdogs**: camera stall → reopen; a camera read that never returns
+  (wedged virtual-camera driver) is detected and recovered — the app can no
+  longer freeze silently; frozen virtual cam (source died) → cursor halts + a
+  clear message; dim-light/repeat-frame warnings; Ctrl+Alt+H panic stop.
 
 Tuning decisions are measured, not vibes: `build/tune_chain.py` and
 `build/tune_repeats.py` simulate the full chain on synthetic hand motion and

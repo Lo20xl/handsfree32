@@ -1,9 +1,9 @@
 HandJob3000 — hand-gesture mouse control for Windows
 ======================================================
-Version 2.4.4  (x64, Windows 10/11)
+Version 2.4.5  (x64, Windows 10/11)
 
 INSTALL
-  1. Double-click  HandJob3000-Setup-2.4.4.exe
+  1. Double-click  HandJob3000-Setup-2.4.5.exe
   2. No administrator rights needed — it installs for the current user only
      (default: %LOCALAPPDATA%\Programs\HandJob3000, desktop shortcut optional).
   3. Launch HandJob3000 from the desktop or Start menu.
@@ -35,6 +35,14 @@ QUICK START
 
   The preview shows only the hand wireframe by default (no camera image).
   Switch it in the Camera card: Wireframe / Camera / Off.
+
+WHAT'S NEW IN 2.4.5
+  * No more freezing on a stuck camera: camera reads now run on their own
+    thread. Some virtual-camera drivers (seen with the NVIDIA Broadcast
+    chain) accept a camera and then stop returning frames entirely — that
+    used to freeze the app silently (frozen preview, UI alive). Now the app
+    notices within ~4 s and reopens the camera itself; if the driver stays
+    stuck it says exactly that instead of pretending everything is fine.
 
 WHAT'S NEW IN 2.4.1 - 2.4.4
   * Smoothness pass (2.4.1): the cursor ring now redraws at the cursor's own

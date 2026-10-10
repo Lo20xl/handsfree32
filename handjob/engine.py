@@ -47,7 +47,9 @@ WHITE_BGR = (255, 255, 255)
 
 ENGINE_FPS_FALLBACK = 30     # pacing target when capture_fps is unknown
 PREVIEW_MIN_INTERVAL = 0.034  # ~30 fps preview encode — the UI mirrors tracking 1:1
-CAMERA_STALL_S = 2.0         # reopen the camera after this long with no frames
+CAMERA_STALL_S = 4.0         # NO frames at all for this long -> the read is stuck
+CAMERA_STALL_REOPENS = 3     # consecutive stall reopens before giving up (per ~minute)
+CAMERA_OPEN_DEADLINE_S = 12.0  # a wedged driver can hang VideoCapture() itself
 CAMERA_MIN_FPS = 12.0        # delivered fps below this = driver trickle mode
 FROZEN_UNIQUE_FPS = 2.0      # at/below this the source is frozen, not merely slow
 FROZEN_ERR = ("camera frozen — same frame repeating, ~0 new frames/s. Virtual cameras "
@@ -64,6 +66,90 @@ def _is_dup_sig(sig, prev) -> bool:
     produces a new one; feeding those repeats downstream inflates every dt and
     velocity estimate, so they must be dropped before the pipeline."""
     return prev is not None and float(np.abs(sig - prev).mean()) <= SIG_EPS
+
+
+def _stall_decision(stalls, max_reopens):
+    """After `stalls` consecutive no-frame reopen attempts: what next?
+
+    'reopen' while attempts remain, then 'give_up' — same policy style as the
+    frozen-camera watchdog. Chronic flappers get a clear error instead of an
+    endless reopen loop."""
+    return "give_up" if stalls > max_reopens else "reopen"
+
+
+class _CamReader(threading.Thread):
+    """Reads frames from a VideoCapture on its OWN thread so a driver-level
+    blocking read() can never wedge the engine loop.
+
+    A virtual-camera driver in a bad state can accept a capture and then never
+    return from read() — observed live with the NVIDIA Broadcast chain: the
+    engine thread sat in read() forever while the UI stayed up, so the user saw
+    a frozen preview and no tracking. The engine instead WAITS here with a
+    timeout and can abandon this reader (a read stuck in the driver cannot be
+    interrupted; the daemon thread leaks until the driver returns, if ever) and
+    open a fresh capture.
+
+    The newest frame wins (single slot): a slow consumer never builds a backlog.
+    """
+
+    def __init__(self, cap, max_hz=90.0):
+        super().__init__(daemon=True, name="HJ3-CamReader")
+        self.cap = cap
+        self._min_dt = 1.0 / max(1.0, float(max_hz))
+        self._cv = threading.Condition()
+        self._slot = None            # (t_read, frame) — newest
+        self._seq = 0
+        self._fail_since = None      # wall time since the driver started failing reads
+        self._stop = threading.Event()
+
+    def run(self):
+        cap = self.cap
+        while not self._stop.is_set():
+            t0 = time.time()
+            try:
+                ok, frame = cap.read()
+            except Exception:
+                ok, frame = False, None
+            if self._stop.is_set():
+                break
+            with self._cv:
+                if ok:
+                    self._fail_since = None
+                    self._slot = (time.time(), frame)
+                    self._seq += 1
+                elif self._fail_since is None:
+                    self._fail_since = time.time()
+                self._cv.notify_all()
+            dt = time.time() - t0
+            wait = self._min_dt - dt
+            if wait > 0:
+                time.sleep(wait)      # a vcam answering instantly must not spin a core
+        # best-effort release; this thread may itself be stuck in read() — fine,
+        # it is a daemon and the app never waits on it past `_stop_reader`'s join
+        try:
+            cap.release()
+        except Exception:
+            pass
+
+    def get(self, last_seq, timeout):
+        """Wait for a frame newer than `last_seq`.
+
+        Returns (seq, t_read, frame), or None when nothing arrived in `timeout`
+        (frame=None means the driver reported a failed read)."""
+        with self._cv:
+            self._cv.wait_for(
+                lambda: self._seq != last_seq or self._fail_since is not None or self._stop.is_set(),
+                timeout=timeout)
+            if self._seq != last_seq:
+                return self._seq, self._slot[0], self._slot[1]
+            if self._fail_since is not None:
+                return self._seq, None, None
+            return None
+
+    def abandon(self):
+        self._stop.set()
+        with self._cv:
+            self._cv.notify_all()
 
 
 def _frozen_cam_state(urate, streak):
@@ -337,6 +423,11 @@ class Engine(threading.Thread):
         self._read_count = 0            # raw reads (rate watchdog); bus.frames counts processed
         self._dedupe = False            # True when the capture is a real camera we opened
         self._uniq_reopened_cam = None  # one-chance repeat reopen per camera (see unique watchdog)
+        self._reader = None             # _CamReader while a capture is open
+        self._reader_seq = 0            # sequence of the newest consumed frame
+        self._last_frame_wall = time.time()  # wall time of the newest frame (read-stall watchdog)
+        self._read_stalls = 0           # consecutive stall reopens (reset after a healthy minute)
+        self._read_stall_t = 0.0
         self.sonar = None               # Sonar instance while enabled (experimental)
         self._sonar_fail = None         # key that failed to start — no retry spam
         self._sonar_last_error = None
@@ -504,6 +595,79 @@ class Engine(threading.Thread):
                 time.sleep(1.2)
         return cap
 
+    def _open_bounded(self, cam, deadline=None):
+        """`_open_with_retry` that can never block the engine for long: a wedged
+        driver can hang VideoCapture()/the probe itself. On timeout the daemon
+        helper is abandoned (if it later returns a capture, that handle is
+        garbage-collected). Returns the capture or None."""
+        deadline = CAMERA_OPEN_DEADLINE_S if deadline is None else deadline
+        box = {}
+
+        def work():
+            box["cap"] = self._open_with_retry(cam)
+
+        th = threading.Thread(target=work, daemon=True, name="HJ3-CamOpen")
+        th.start()
+        th.join(deadline)
+        if th.is_alive():
+            log.error("camera %s: open still running after %.0fs — driver looks stuck", cam, deadline)
+            return None
+        return box.get("cap")
+
+    def _start_reader(self):
+        """Wrap the current capture in a reader thread (idempotent)."""
+        self._stop_reader()
+        if self.capture is None:
+            return
+        self._reader = _CamReader(self.capture, max_hz=1.5 * float(self._target_fps))
+        self._reader_seq = 0
+        self._last_frame_wall = time.time()
+        self._reader.start()
+
+    def _stop_reader(self):
+        """Detach the reader. A read stuck in a driver can't be interrupted, so
+        the thread may be abandoned (daemon; it dies with the app). The app
+        never blocks on it — that is the whole point of the reader design."""
+        r = self._reader
+        self._reader = None
+        if r is None:
+            return
+        r.abandon()
+        r.join(timeout=1.0)
+        if r.is_alive():
+            log.info("camera reader did not exit within 1 s — abandoning it (driver stuck)")
+
+    def _stall_recover(self):
+        """No frames for CAMERA_STALL_S: the read (or the whole driver) is stuck.
+        Reopen bounded; give up with a clear error after repeated stalls.
+        Returns False when the engine should give up."""
+        self._read_stalls += 1
+        self._read_stall_t = time.time()
+        if _stall_decision(self._read_stalls, CAMERA_STALL_REOPENS) == "give_up":
+            self._stop_reader()
+            self.bus.error = ("camera keeps going silent — the driver looks stuck: close other camera "
+                              "apps or pick another camera, then click Refresh app")
+            log.error("camera %s: %d stalls in a row — giving up (driver stuck)",
+                      self._cam_index, self._read_stalls)
+            return False
+        log.warning("camera %s: no frames for %.1fs — reopening (stall %d/%d)",
+                    self._cam_index, time.time() - self._last_frame_wall,
+                    self._read_stalls, CAMERA_STALL_REOPENS)
+        self._stop_reader()
+        self.capture = None
+        cap = self._open_bounded(self._cam_index)
+        if cap is None:
+            self.bus.error = (f"camera {self._cam_index} open is not responding — the driver looks "
+                              "stuck; click Refresh app")
+            return False
+        self.capture = cap
+        self._start_reader()
+        self._last_proc_sig = None
+        self._sig_ring.clear()
+        self.bus.error = None
+        log.info("camera %s reopened after stall", self._cam_index)
+        return True
+
     def request_camera(self, idx):
         """Ask the engine thread to switch cameras on its next frame."""
         self._cam_request = int(idx)
@@ -551,12 +715,13 @@ class Engine(threading.Thread):
         cam = int(settings.get("camera_index"))
         self._cam_index = cam
         if not (self.capture and self.capture.isOpened()):  # reuse a pre-opened capture (probe flow)
-            self.capture = self._open_with_retry(cam)
+            self.capture = self._open_bounded(cam)
             self._dedupe = self.capture is not None        # dup gate: real cams only (probe/fake feeds differ every frame)
         if self.capture is None:
             log.error("camera %s not available", cam)
             self.bus.error = f"camera {cam} unavailable — close other camera apps and reopen"
             return
+        self._start_reader()
         log.info("camera %s open, engine loop running", cam)
         self.start_t = time.time()
         first_frame_logged = False
@@ -577,18 +742,14 @@ class Engine(threading.Thread):
         consecutive_errors = 0
         dark_streak = 0
         bright_streak = 0
-        fail_since = 0.0
         while not self._stop.is_set():
             req = self._cam_request
             if req is not None:
                 self._cam_request = None
                 log.info("camera switch requested -> %s", req)
-                try:
-                    self.capture.release()
-                except Exception:
-                    pass
+                self._stop_reader()
                 self.capture = None
-                self.capture = self._open_with_retry(req)
+                self.capture = self._open_bounded(req)
                 if self.capture is None:
                     log.error("camera switch to %s failed", req)
                     self.bus.error = f"camera {req} unavailable"
@@ -597,9 +758,11 @@ class Engine(threading.Thread):
                     self._dedupe = True
                     self.bus.error = None
                     self._frozen_streak = 0
+                    self._read_stalls = 0
                     self._last_proc_sig = None
                     self._uniq_reopened_cam = None   # a manual switch re-arms the one-chance reopen
                     self._sig_ring.clear()
+                    self._start_reader()
                     log.info("camera switched to %s", req)
             if self._driver_dialog:
                 self._driver_dialog = False
@@ -607,36 +770,30 @@ class Engine(threading.Thread):
                     self.capture.set(cv2.CAP_PROP_SETTINGS, 1)   # modal; returns when closed
                 except Exception:
                     log.exception("camera driver settings dialog failed")
-            try:
-                ok, frame = self.capture.read()
-            except Exception:
-                ok, frame = False, None
-            if not ok:
-                if fail_since == 0.0:
-                    fail_since = time.time()
-                elif time.time() - fail_since > CAMERA_STALL_S:
-                    log.warning("camera %s stalled %.1fs — reopening",
-                                self._cam_index, time.time() - fail_since)
-                    fail_since = 0.0
-                    try:
-                        self.capture.release()
-                    except Exception:
-                        pass
-                    self.capture = self._open_with_retry(self._cam_index)
-                    if self.capture is None:
-                        self.bus.error = f"camera {self._cam_index} lost — click Refresh app"
-                        return
-                    self._last_proc_sig = None
-                    self._sig_ring.clear()
-                    log.info("camera %s reopened", self._cam_index)
+            # consume from the reader thread: a driver-blocked read() shows up
+            # here as a get() timeout, never as a wedged engine loop
+            if self._reader is None:
+                time.sleep(0.05)                  # between cameras: don't spin
+                item = None
+            else:
+                item = self._reader.get(self._reader_seq, 0.25)
+            if item is None:
+                if time.time() - self._last_frame_wall > CAMERA_STALL_S and not self._stall_recover():
+                    return
+                continue
+            self._reader_seq, t_read, frame = item
+            if frame is None:                     # the driver reports failed reads
+                if time.time() - self._last_frame_wall > CAMERA_STALL_S and not self._stall_recover():
+                    return
                 time.sleep(0.05)
                 continue
-            fail_since = 0.0
+            self._last_frame_wall = t_read
+            if self._read_stalls and time.time() - self._read_stall_t > 60.0:
+                self._read_stalls = 0             # a healthy minute re-arms the reopen budget
             # TIMESTAMP = the moment the frame arrived. Everything downstream (landmark
             # filters, pose dwell, click timing, cursor velocity) works from this, not
             # from "after inference": inference time varies 10-30 ms frame to frame and
             # stamping after it injects that noise into every dt and velocity estimate.
-            t_read = time.time()
             # cheap content signature for the unique-frame watchdog + dup gate (non-blocking)
             sig = None
             try:
@@ -1241,10 +1398,20 @@ class Engine(threading.Thread):
         except Exception:
             pass
         try:
-            if self.capture:
-                self.capture.release()
+            had_reader = self._reader is not None
+            self._stop_reader()          # never block app exit on a stuck driver
+            if self.capture is not None and not had_reader:
+                cap, self.capture = self.capture, None
+                threading.Thread(target=self._safe_release, args=(cap,), daemon=True).start()
             if self.landmarker:
                 self.landmarker.close()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _safe_release(cap) -> None:
+        try:
+            cap.release()
         except Exception:
             pass
 
