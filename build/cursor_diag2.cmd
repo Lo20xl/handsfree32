@@ -1,0 +1,4 @@
+@echo off
+cd /d C:\Users\tangy\Desktop\HandJob3000
+.venv\Scripts\python.exe -c "import sys, time, ctypes; sys.path.insert(0,'.'); from handjob import input_win32 as wi; from ctypes import wintypes; u=ctypes.windll.user32; ctypes.windll.shcore.SetProcessDpiAwareness(2) if hasattr(ctypes.windll,'shcore') else None; print('screen:', wi.virtual_screen()); [print('move', (a,b), '-> +0.1s', (wi.move_absolute(a,b) or wi.cursor_pos()), '+0.8s', (time.sleep(0.7) or wi.cursor_pos())) for a,b in [(100,100),(3000,1300),(1720,720)]]; h=u.FindWindowW(None, 'Roblox'); r=wintypes.RECT(); u.GetWindowRect(h, ctypes.byref(r)) if h else None; print('roblox hwnd:', h, 'rect:', (r.left, r.top, r.right, r.bottom) if h else None)" > C:\Users\tangy\Desktop\HandJob3000\build\cursor_diag2_out.txt 2>&1
+echo DIAG2_EXIT=%ERRORLEVEL% >> C:\Users\tangy\Desktop\HandJob3000\build\cursor_diag2_out.txt

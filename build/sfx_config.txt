@@ -1,0 +1,6 @@
+;!@Install@!UTF-8!
+Title="HandJob3500 1.1.0"
+BeginPrompt="Extract HandJob3500 (hand-gesture mouse control)?"
+InstallPath="%LOCALAPPDATA%\\Programs\\HandJob3500"
+RunProgram="HandJob3500.exe"
+;!@InstallEnd@!

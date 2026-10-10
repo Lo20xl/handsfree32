@@ -1,0 +1,4 @@
+@echo off
+cd /d C:\Users\tangy\Desktop\HandJob3000
+.venv\Scripts\python.exe -c "import sys; sys.path.insert(0,'.'); from handjob import input_win32 as wi; import ctypes, time; from ctypes import wintypes; u=ctypes.windll.user32; wi._dpi_aware() if hasattr(wi,'_dpi_aware') else None; hwnd=u.GetForegroundWindow(); buf=ctypes.create_unicode_buffer(256); u.GetWindowTextW(hwnd, buf, 256); print('foreground:', repr(buf.value)); print('virtual_screen:', wi.virtual_screen()); x0,y0=wi.cursor_pos(); print('cursor start:', (x0,y0)); tx,ty=x0+100,y0+100; wi.move_absolute(tx,ty); time.sleep(0.03); print('after move +30ms:', wi.cursor_pos(), 'want', (tx,ty)); time.sleep(0.4); print('after move +430ms:', wi.cursor_pos()); wi.move_absolute(x0,y0); print('restored')" > C:\Users\tangy\Desktop\HandJob3000\build\cursor_diag_out.txt 2>&1
+echo DIAG_EXIT=%ERRORLEVEL% >> C:\Users\tangy\Desktop\HandJob3000\build\cursor_diag_out.txt

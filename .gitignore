@@ -1,0 +1,39 @@
+# venv & python
+.venv/
+__pycache__/
+*.pyc
+
+# build byproducts: PyInstaller workdirs, packaged apps, installers, archives
+dist/
+dist-installer/
+build/HandJob3000/
+build/HandJob3500/
+build/HandJob4100/
+build/HandJob4200/
+build/superseded/
+build/models_lab/
+build/out/
+build/from_claude/
+build/*.7z
+build/*.exe
+build/*.log
+build/*_out.txt
+build/*.png
+build/dbg_drag.py
+
+# local state & logs
+settings.json
+*.log
+crash.log
+*.bak
+
+# OS noise
+Thumbs.db
+desktop.ini
+
+# stray dev backups / transient outputs
+ui/*.140bak
+build/from_claude2/
+build/frozen_result.txt
+build/inno_done*.txt
+build/overlay_hold_state.txt
