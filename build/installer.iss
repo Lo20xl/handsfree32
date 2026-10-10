@@ -2,7 +2,7 @@
 ; Per-user install (no admin), Desktop icon default on, launch after install,
 ; clean uninstaller, optional "start control on launch" preference.
 #define AppName "HandJob3000"
-#define AppVersion "2.5.3"
+#define AppVersion "2.5.4"
 #define AppExe "HandJob3000.exe"
 
 [Setup]

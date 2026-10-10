@@ -55,6 +55,16 @@ FROZEN_ERR = ("camera frozen — same frame repeating, ~0 new frames/s. Virtual 
               "dropdown or fix the source (unpause / reconnect), then click Refresh app")
 SIG_EPS = 0.35                # 16x16 mean-abs diff at/below this = the same frame
 
+# device names that identify a VIRTUAL camera chain (their frame source is a
+# separate app/phone we cannot see; "reads/s" then says nothing about liveness)
+_VIRTUAL_CAM_HINTS = ("camo", "broadcast", "obs", "virtual", "snap", "manycam",
+                      "droidcam", "iriun", "epoccam", "ndi")
+
+
+def _is_virtual_cam_name(name: str) -> bool:
+    n = (name or "").lower()
+    return any(h in n for h in _VIRTUAL_CAM_HINTS)
+
 
 def _is_dup_sig(sig, prev) -> bool:
     """True when `sig` is (within sensor noise) the same frame as `prev`.
@@ -424,6 +434,8 @@ class Engine(threading.Thread):
         self._backend_seen = str(settings.get("backend") or "auto")  # live backend switching
         self._backend_name = "mediapipe"                             # what _load_model picked
         self._mp_image_cls = None       # set when the mediapipe backend loads (lazy import)
+        self._last_frame_dark = False   # last read frame was (near) black
+        self._cam_names = None          # index -> device name (lazy, per run)
         self._uniq_check_t = 0.0        # unique-frame watchdog state
         self._uniq_reopen_t = 0.0
         self._uniq_bad_streak = 0
@@ -714,6 +726,17 @@ class Engine(threading.Thread):
         reason a camera quietly drops to ~7-10 fps in a dim room."""
         self._driver_dialog = True
 
+    def _cam_device_name(self):
+        """Name of the active camera index (pygrabber, cached per app run; ""
+        when enumeration is unavailable)."""
+        try:
+            if self._cam_names is None:
+                self._cam_names = {int(c["index"]): str(c.get("name") or "")
+                                   for c in list_cameras()}
+            return self._cam_names.get(int(self._cam_index), "")
+        except Exception:
+            return ""
+
     def _load_model(self):
         """Load the configured inference backend.
 
@@ -818,8 +841,7 @@ class Engine(threading.Thread):
         ema_dt = 1 / 30
         last_beat = 0.0
         consecutive_errors = 0
-        dark_streak = 0
-        bright_streak = 0
+        dark_since = 0.0
         while not self._stop.is_set():
             req = self._cam_request
             if req is not None:
@@ -884,6 +906,25 @@ class Engine(threading.Thread):
             except Exception:
                 pass
             self._read_count += 1
+            # black-frame watchdog: time-based and READ-based, so it also fires
+            # when a camera repeats ONE black frame (the old per-processed-frame
+            # counter never advanced for duplicates — this exact case was blind).
+            try:
+                dark_now = float(np.mean(frame[::16, ::16])) < 2.0
+            except Exception:
+                dark_now = False
+            self._last_frame_dark = dark_now
+            if dark_now:
+                if dark_since == 0.0:
+                    dark_since = time.time()
+                elif time.time() - dark_since > 3.0 and not self.bus.warning:
+                    self.bus.warning = ("camera is delivering black frames — check the lens cover, "
+                                        "Windows camera privacy settings, or the virtual camera's source")
+                    log.warning("camera black-frame watchdog tripped")
+            else:
+                dark_since = 0.0
+                if self.bus.warning and "black frames" in self.bus.warning:
+                    self.bus.warning = None
             # delivered-rate watchdog: if the RAW read feed degrades below the usable
             # threshold after opening (USB power saving, another app), reopen
             # once so the 720p->640x480 ladder can re-measure. Never reopens
@@ -914,23 +955,33 @@ class Engine(threading.Thread):
                 if rrate and urate is not None:
                     self.bus.cam_reads = round(rrate, 1)
                     self.bus.cam_unique = round(urate, 1)
-                    # the camera itself is the bottleneck: tell the user, once, what to do
+                    # the camera itself is the bottleneck: tell the user, once, and
+                    # name the actual device — the reason depends on WHAT it is, not
+                    # on the read rate (a deep-idle virtual cam answers slowly, a
+                    # busy one answers fast while repeating its standby screen).
                     if urate < 18.0:
                         self._slow_cam_streak += 1
                         if self._slow_cam_streak >= 2 and not self.bus.warning:
-                            if rrate > 40.0:
-                                # answers reads instantly + few new frames = virtual cam
-                                self.bus.warning = (f"camera answers {rrate:.0f} reads/s but sends the SAME "
-                                                    f"image every time (~{urate:.0f} new frames/s) — a readout of "
-                                                    "60 fps only means the driver answers, not that the picture "
-                                                    "changes. The source isn't delivering video: unpause / reconnect "
-                                                    "it (Camo, NVIDIA Broadcast, OBS — a paused or disconnected "
-                                                    "phone shows a still standby screen), or pick a directly "
-                                                    "connected camera")
+                            name = self._cam_device_name()
+                            did = f"camera {self._cam_index}" + (f" ({name})" if name else "")
+                            if self._last_frame_dark:
+                                self.bus.warning = (f"{did} is delivering black frames — check the lens "
+                                                    "cover or Windows camera privacy settings; for a virtual "
+                                                    "camera, check its source app (it may be paused or "
+                                                    "disconnected)")
+                            elif _is_virtual_cam_name(name) or rrate > 40.0:
+                                self.bus.warning = (f"{did} isn't delivering video "
+                                                    f"(~{urate:.0f} new frames/s of {rrate:.0f} reads/s — reads "
+                                                    "only mean the driver answers, not that the picture "
+                                                    "changes). Its source app is paused, asleep, or the phone "
+                                                    "is disconnected: unpause / reconnect it (Camo, NVIDIA "
+                                                    "Broadcast, OBS). If it keeps happening with Camo, turn "
+                                                    "OFF its auto-pause option, or pick another camera")
                             else:
-                                self.bus.warning = (f"camera delivers only ~{urate:.0f} new frames/s (tracking can't be "
-                                                    "smoother than that). Usually dim light: add light, or open Camera "
-                                                    "driver settings and turn off low-light compensation / dynamic frame rate")
+                                self.bus.warning = (f"{did} delivers only ~{urate:.0f} new frames/s (tracking can't "
+                                                    "be smoother than that). Usually dim light: add light, or open "
+                                                    "Camera driver settings and turn off low-light compensation / "
+                                                    "dynamic frame rate")
                     else:
                         self._slow_cam_streak = 0
                         if self.bus.warning and "new frames/s" in self.bus.warning:
@@ -966,19 +1017,6 @@ class Engine(threading.Thread):
                 first_frame_logged = True
                 log.info("first frame captured %sx%s (target %s Hz, num_hands=%s)",
                          frame.shape[1], frame.shape[0], self._target_fps, self._hands_seen)
-            if self.bus.frames % 10 == 0:
-                if float(np.mean(frame[::16, ::16])) < 2.0:
-                    dark_streak += 1
-                    bright_streak = 0
-                    if dark_streak == 30 and not self.bus.warning:  # ~10s at 30fps
-                        self.bus.warning = ("camera is delivering black frames — check the lens cover, "
-                                            "Windows camera privacy settings, or close other camera apps")
-                        log.warning("camera black-frame watchdog tripped")
-                else:
-                    bright_streak += 1
-                    dark_streak = 0
-                    if bright_streak > 3 and self.bus.warning and "black frames" in self.bus.warning:
-                        self.bus.warning = None
             cfg = settings.get()
             # dt-scaled prediction: the emitter needs a camera interval of lead
             # to interpolate across; at ~10 fps feeds the slider value alone

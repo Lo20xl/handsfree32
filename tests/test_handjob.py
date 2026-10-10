@@ -1587,6 +1587,26 @@ def test_cam_reader_join_after_exit():
     assert not r.is_alive()
 
 
+def test_camera_diagnostics_permanent():
+    """2.5.4: camera diagnostics are NAME-aware and the black-frame watchdog is
+    time/read-based — the two root causes behind 'blank camera + wrong advice':
+    a deep-idle virtual cam answers slowly (got dim-light advice) and repeated
+    black frames never reached the old per-processed-frame counter."""
+    import handjob.engine as engmod
+    from handjob.engine import _is_virtual_cam_name
+    assert _is_virtual_cam_name("Camo")
+    assert _is_virtual_cam_name("Camera (NVIDIA Broadcast)")
+    assert _is_virtual_cam_name("OBS Virtual Camera")
+    assert not _is_virtual_cam_name("HD Webcam C920")
+    assert not _is_virtual_cam_name("")
+    src = open(engmod.__file__, encoding="utf-8").read()
+    assert "_cam_device_name" in src
+    assert "self._last_frame_dark" in src
+    # the black check must run ABOVE the dup gate, or repeated black frames
+    # (the exact paused-vcam case) are skipped before it executes
+    assert src.index("dark_now = float") < src.index("_is_dup_sig(sig, self._last_proc_sig)")
+
+
 def test_settings_21_keys():
     """New 2.1 settings clamp correctly (choices, ranges, bools)."""
     from handjob import settings as S

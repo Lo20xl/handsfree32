@@ -128,6 +128,7 @@ class Api:
                 "cam_reads": bus.cam_reads,
                 "cam_unique": bus.cam_unique,
                 "backend": getattr(self.engine, "_backend_name", "mediapipe"),
+                "cam_name": self.engine._cam_device_name(),
             }
 
     def _sonar_state(self):

@@ -260,3 +260,18 @@ of it (the 2.5.1 fixes) but its own overhead made the bad phase worse.
 | `settings.cam_mode_cache` = `{index: [w,h]}`: the mode a camera last landed on is opened DIRECTLY on later launches. Full ladder re-measures only when the delivered-rate watchdog or a stall fires (`request_camera(..., use_cache=False)` / `_stall_recover`). | The ladder boots one helper exe per rung (frozen exe start ≈ 2-3 s each) — the cached path skips 5-6 s of most launches. |
 | Camera open runs on its own thread, overlapping `_load_model()` (joined before the loop starts). | The open and model load were serialised. |
 | Delivered-rate watchdog: one 3-s window is enough when rate < 5 fps (was 2). | Faster recovery from a trickling/vcam-waking source. |
+
+---
+
+## 17. 2.5.3–2.5.4 — camera diagnostics that tell the truth
+
+Trigger: user reports "camera blank / wrong advice". Root causes on the APP side:
+
+| Cause | Fix |
+|---|---|
+| The paused-video id fix branch was chosen by READ-RATE (`rrate > 40`) — a deep-idle virtual cam answers ~1-60 reads/s, so a paused Camo got the **dim-light** advice (wrong) while a busy repeater got the virtual-cam advice. | Name-aware classification: `_is_virtual_cam_name()` matches the device name (camo/broadcast/obs/virtual/snap/…, from pygrabber, cached per run) + read-rate only as a fallback. Messages now NAME the device (`camera 0 (Camo)`), distinguish **black frames / not-delivering-video / genuinely-slow-physical**, and mention Camo's auto-pause behavior. |
+| The black-frame watchdog ran on PROCESSED frames (`bus.frames % 10`), so a camera repeating ONE black frame (exactly the paused-vcam case) never incremented it. | Time-based black check placed ABOVE the dup gate (per read): ≥3 s of dark reads → warning; clears on light. `self._last_frame_dark` feeds the message picker. |
+| Diagnostics didn't identify the device | `Engine._cam_device_name()` + `get_state()["cam_name"]`. |
+
+Also shipped: `DEBUGGING.md` (full pipeline map + metrics + tool list) and
+`build/make_diagnostics_zip.sh` (regenerates the diagnostics bundle).

@@ -1,9 +1,9 @@
 HandJob3000 — hand-gesture mouse control for Windows
 ======================================================
-Version 2.5.3  (x64, Windows 10/11)
+Version 2.5.4  (x64, Windows 10/11)
 
 INSTALL
-  1. Double-click  HandJob3000-Setup-2.5.3.exe
+  1. Double-click  HandJob3000-Setup-2.5.4.exe
   2. No administrator rights needed — it installs for the current user only
      (default: %LOCALAPPDATA%\Programs\HandJob3000, desktop shortcut optional).
   3. Launch HandJob3000 from the desktop or Start menu.
@@ -35,6 +35,18 @@ QUICK START
 
   The preview shows only the hand wireframe by default (no camera image).
   Switch it in the Camera card: Wireframe / Camera / Off.
+
+WHAT'S NEW IN 2.5.3 - 2.5.4
+  * Camera diagnostics that say what's actually wrong — and stop giving the
+    wrong advice:
+      - The app now knows each camera's real name and classifies it: a
+        virtual camera whose source is paused, asleep, or disconnected gets
+        its own message naming the device and the fix (including a pointer to
+        Camo's auto-pause option) instead of the dim-light hint. A "60 fps"
+        readout only means the driver answers — not that the picture changes.
+      - Black-frame detection now also triggers when the camera repeats ONE
+        black frame (that case was skipped as a "duplicate" before), and the
+        camera name is included in diagnostics.
 
 WHAT'S NEW IN 2.5.2
   * Much faster startup and quicker recovery from sleepy cameras:
