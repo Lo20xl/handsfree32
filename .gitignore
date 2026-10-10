@@ -37,3 +37,7 @@ build/from_claude2/
 build/frozen_result.txt
 build/inno_done*.txt
 build/overlay_hold_state.txt
+
+# mediapipe test fixtures (downloaded, not redistributed)
+build/*.jpg
+build/*_landmarks.pbtxt
