@@ -48,6 +48,12 @@ camera → landmark stabilizer (adaptive 1€ filter + spike gate + palm guard)
   that keeps a still hand rock-steady with zero added lag in motion.
 - **Dedicated emitter thread** (high priority, 144 Hz) owns all cursor moves;
   the overlay draws in lock-step with it (dirty-rect layered window).
+- **GPU inference (2.5.0, experimental)**: the hand models also run on the GPU
+  through ONNX Runtime / DirectML — the landmark stage measures ~0.6 ms/frame
+  on an RTX 5070 vs ~7.5 ms on the MediaPipe CPU path (~10x). Enabled
+  automatically when available; set the System card's **Inference engine** to
+  `CPU — MediaPipe` to force the original path. Custom models and 2-hand mode
+  always use the CPU engine.
 - **Watchdogs**: camera stall → reopen; a camera read that never returns
   (wedged virtual-camera driver) is detected and recovered — the app can no
   longer freeze silently; frozen virtual cam (source died) → cursor halts + a

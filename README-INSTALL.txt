@@ -1,9 +1,9 @@
 HandJob3000 — hand-gesture mouse control for Windows
 ======================================================
-Version 2.4.5  (x64, Windows 10/11)
+Version 2.5.0  (x64, Windows 10/11)
 
 INSTALL
-  1. Double-click  HandJob3000-Setup-2.4.5.exe
+  1. Double-click  HandJob3000-Setup-2.5.0.exe
   2. No administrator rights needed — it installs for the current user only
      (default: %LOCALAPPDATA%\Programs\HandJob3000, desktop shortcut optional).
   3. Launch HandJob3000 from the desktop or Start menu.
@@ -35,6 +35,15 @@ QUICK START
 
   The preview shows only the hand wireframe by default (no camera image).
   Switch it in the Camera card: Wireframe / Camera / Off.
+
+WHAT'S NEW IN 2.5.0
+  * GPU inference engine (experimental): a second inference backend runs the
+    hand models on your graphics card via ONNX Runtime + DirectML — the
+    landmark stage goes from ~7.5 ms to ~0.6 ms per frame on a modern GPU,
+    cutting the app's CPU use dramatically and shaving latency. It turns on
+    automatically (System card: "Inference engine"), falls back to the CPU
+    engine if anything is unavailable, and can be forced off there too.
+    Custom .task models and 2-hand mode keep using the CPU engine.
 
 WHAT'S NEW IN 2.4.5
   * No more freezing on a stuck camera: camera reads now run on their own

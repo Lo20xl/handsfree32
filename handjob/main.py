@@ -127,6 +127,7 @@ class Api:
                 "sonar": self._sonar_state(),
                 "cam_reads": bus.cam_reads,
                 "cam_unique": bus.cam_unique,
+                "backend": getattr(self.engine, "_backend_name", "mediapipe"),
             }
 
     def _sonar_state(self):
@@ -341,6 +342,7 @@ def run_dev_selftest():
     eng = Engine(bus)
     eng._load_model()
     print("MODEL_LOAD_OK", eng.landmarker is not None)
+    print("BACKEND", getattr(eng, "_backend_name", "?"))
     # sonar stack (experimental): sounddevice + bundled portaudio must survive
     # packaging — a missing DLL fails silently at feature-use time otherwise
     try:
@@ -555,6 +557,7 @@ def run_probe(seconds=3.0):
         _t.sleep(float(seconds))
         frames = bus.frames - base
         fps, lat = bus.fps, bus.latency_ms
+        print(f"  backend: {getattr(eng, '_backend_name', '?')}")
         err = bus.error
         eng.stop()
         eng.cleanup()

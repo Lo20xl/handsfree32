@@ -1477,6 +1477,29 @@ def test_effective_prediction_scales_with_dt():
     assert _effective_prediction(120, 1 / 30) == 120      # user value respected
 
 
+def test_backend_selection_and_wiring():
+    """2.5: inference backend setting — auto/onnx mediapipe selection, live
+    switch wiring, ONNX assets present, and the hand_onnx module's interface
+    matches what the engine consumes."""
+    import os
+    from handjob import settings as S
+    from handjob.paths import assets_dir
+    assert S._clamp("backend", "onnx") == "onnx"
+    assert S._clamp("backend", "wat") == "auto"
+    assert S._clamp("backend", None) == "auto"
+    d = os.path.join(assets_dir(), "hand_onnx")
+    assert os.path.exists(os.path.join(d, "palm_detection_full.onnx"))
+    assert os.path.exists(os.path.join(d, "hand_landmark_lite.onnx"))
+    from handjob.hand_onnx import OnnxHandLandmarker  # importable (runtime optional)
+    assert hasattr(OnnxHandLandmarker, "detect_for_video")
+    assert hasattr(OnnxHandLandmarker, "close")
+    import handjob.engine as engmod
+    src = open(engmod.__file__, encoding="utf-8").read()
+    assert 'settings.get("backend")' in src
+    assert "_backend_seen" in src
+    assert 'backend_now = str(cfg.get("backend")' in src  # live switch in the loop
+
+
 def test_settings_21_keys():
     """New 2.1 settings clamp correctly (choices, ranges, bools)."""
     from handjob import settings as S

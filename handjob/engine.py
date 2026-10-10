@@ -415,6 +415,8 @@ class Engine(threading.Thread):
         self._rate_reopen_t = 0.0
         self._pred_seen = None
         self._model_seen = str(settings.get("model_file") or "")   # live model switching
+        self._backend_seen = str(settings.get("backend") or "auto")  # live backend switching
+        self._backend_name = "mediapipe"                             # what _load_model picked
         self._uniq_check_t = 0.0        # unique-frame watchdog state
         self._uniq_reopen_t = 0.0
         self._uniq_bad_streak = 0
@@ -679,15 +681,43 @@ class Engine(threading.Thread):
         self._driver_dialog = True
 
     def _load_model(self):
+        """Load the configured inference backend.
+
+        'auto'      — ONNX Runtime (DirectML GPU: ~0.6 ms/frame landmark stage
+                      vs ~7.5 ms MediaPipe CPU) when available; MediaPipe CPU
+                      is the always-present fallback.
+        'onnx'      — ONNX Runtime (still falls back to MediaPipe if it cannot
+                      start — a broken runtime must never brick the app).
+        'mediapipe' — the original CPU pipeline.
+
+        Custom .task models and 2-hand mode always use MediaPipe: the ONNX
+        port covers the bundled lite model with one hand."""
+        backend = str(settings.get("backend") or "auto")
+        hands = int(settings.get("max_hands") or 1)
+        wants_custom = bool(str(settings.get("model_file") or "").strip())
+        if backend in ("auto", "onnx") and hands == 1 and not wants_custom:
+            try:
+                from .hand_onnx import OnnxHandLandmarker
+                palm = os.path.join(assets_dir(), "hand_onnx", "palm_detection_full.onnx")
+                land = os.path.join(assets_dir(), "hand_onnx", "hand_landmark_lite.onnx")
+                self.landmarker = OnnxHandLandmarker(palm, land, num_hands=1)
+                self._backend_name = "onnx (" + self.landmarker.backend() + ")"
+                log.info("inference backend: %s", self._backend_name)
+                return
+            except Exception as e:
+                log.warning("onnx backend unavailable (%s: %s) — using mediapipe",
+                            type(e).__name__, e)
         path = _task_path(settings.get("model_file"))
         if not os.path.exists(path):
             # a stored custom model that vanished (deleted/renamed) -> bundled
             log.warning("model %s missing — falling back to the bundled default", path)
             settings.set("model_file", "")
             path = _task_path("")
-        hands = int(settings.get("max_hands") or 1)
         self.landmarker = vision.HandLandmarker.create_from_options(
             _landmarker_options(path, hands))
+        self._backend_name = "mediapipe"
+        log.info("inference backend: mediapipe (hands=%s%s)",
+                 hands, ", custom model" if wants_custom else "")
 
     def run(self):
         try:
@@ -948,6 +978,19 @@ class Engine(threading.Thread):
                         self._load_model()
                     except Exception:
                         log.exception("bundled model reload failed")
+            # inference-backend change -> rebuild the landmarker on the other runtime
+            backend_now = str(cfg.get("backend") or "auto")
+            if backend_now != self._backend_seen:
+                self._backend_seen = backend_now
+                try:
+                    self.landmarker.close()
+                except Exception:
+                    pass
+                try:
+                    self._load_model()
+                    log.info("inference backend switched -> %s", self._backend_name)
+                except Exception:
+                    log.exception("backend switch failed")
 
             # ------- duplicate-frame gate (virtual cams) ------------------------
             # Camo / NVIDIA Broadcast / OBS answer every read by repeating the last

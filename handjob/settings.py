@@ -35,6 +35,9 @@ DEFAULTS = {
     # model selection: "" = bundled hand_landmarker.task; anything else = a
     # MediaPipe .task file imported into models/ beside the app
     "model_file": "",
+    # inference runtime: auto = ONNX-Runtime/DirectML GPU when available
+    # (falls back to MediaPipe CPU), onnx = GPU only-path, mediapipe = CPU
+    "backend": "auto",
     # experimental sonar sensing (speaker+mic Doppler) — sensing only, no control
     "sonar_enabled": False,
     "sonar_in_device": -1,    # sounddevice index; -1 = system default input
@@ -59,6 +62,7 @@ RANGES = {
 BOOL_KEYS = {"invert_scroll", "trail", "sparkles", "start_enabled", "reanchor", "sonar_enabled"}
 CHOICES = {"cursor_style": ("sky", "glow", "system"),
            "preview_mode": ("wireframe", "camera", "off"),
+           "backend": ("auto", "onnx", "mediapipe"),
            "capture_height": (480, 720, 1080),
            "capture_fps": (30, 60),
            "max_hands": (1, 2),

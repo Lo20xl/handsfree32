@@ -1,5 +1,5 @@
 """HandJob3000 — camera hand-gesture mouse control for Windows."""
-__version__ = "2.4.5"
+__version__ = "2.5.0"
 APP_NAME = "HandJob3000"
 
 # mediapipe 1.x eagerly imports its audio stack -> sounddevice -> PortAudio,

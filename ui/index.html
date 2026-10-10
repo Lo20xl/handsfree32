@@ -418,6 +418,15 @@
         <div class="row-note">Switches live in about a second. The list holds the bundled model plus every imported MediaPipe <b>.task</b> hand model; imports are validated before they are accepted.</div>
       </div>
       <div class="row" style="padding-top:13px">
+        <div class="row-top"><label for="sel-backend">Inference engine</label></div>
+        <select id="sel-backend">
+          <option value="auto">Auto — GPU when available</option>
+          <option value="onnx">GPU — ONNX / DirectML</option>
+          <option value="mediapipe">CPU — MediaPipe</option>
+        </select>
+        <div class="row-note">Auto runs the hand models on your GPU (~10× faster inference, much less CPU). Falls back to the CPU engine automatically. Switches live in about a second; custom models and 2-hand mode use the CPU engine.</div>
+      </div>
+      <div class="row" style="padding-top:13px">
         <div class="row-top"><label for="sel-res">Processing size</label></div>
         <select id="sel-res">
           <option value="480">480p — fastest</option>
@@ -455,7 +464,7 @@
   </div>
 </main>
 
-<footer>HandJob3000 v<span id="fVer">2.4.5</span> — local only, nothing leaves your machine. Camera footage never leaves this app.</footer>
+<footer>HandJob3000 v<span id="fVer">2.5.0</span> — local only, nothing leaves your machine. Camera footage never leaves this app.</footer>
 
 <div class="overlay" id="telOverlay">
   <div class="dlg">
@@ -477,12 +486,12 @@ const DEFAULTS = {camera_index:0, sensitivity:0.6, smoothing:0.55, click_thresho
                   trail:true, sparkles:true, preview_mode:"wireframe", capture_height:480,
                   capture_fps:60, max_hands:1, edge_margin:0.04, sonar_enabled:false,
                   sonar_in_device:-1, sonar_out_device:-1, sonar_tone:19000,
-                  start_enabled:false, model_file:""};
+                  start_enabled:false, model_file:"", backend:"auto"};
 
 /* ---- API: real pywebview bridge, or a mock for plain-browser preview ---- */
 const mock = {
   _st:{armed:false, engine_started:true, hand_found:false, fps:0, latency_ms:0, infer_ms:0,
-       error:null, cursor_style:"sky", settings:Object.assign({}, DEFAULTS), version:"2.4.5", sonar:null},
+       error:null, cursor_style:"sky", settings:Object.assign({}, DEFAULTS), version:"2.5.0", sonar:null},
   get_settings(){ return Promise.resolve(Object.assign({}, this._st.settings)); },
   set_setting(k,v){ this._st.settings[k]=v; return Promise.resolve({ok:true, settings:Object.assign({}, this._st.settings)}); },
   reset_settings(){ this._st.settings=Object.assign({}, DEFAULTS); return Promise.resolve({ok:true, settings:Object.assign({}, this._st.settings)}); },
@@ -545,6 +554,7 @@ function applySettings(s){
   if (s.capture_height) $("#sel-res").value = String(s.capture_height);
   if (s.capture_fps) $("#sel-fps").value = String(s.capture_fps);
   $("#sel-hands").value = String(s.max_hands || 1);
+  $("#sel-backend").value = s.backend || "auto";
   $("#sel-sonar-tone").value = String(s.sonar_tone || 19000);
   const pickDev = (sel, v) => { const o = sel.querySelector('option[value="' + v + '"]'); if (o) sel.value = String(v); };
   pickDev($("#sel-sonar-in"), s.sonar_in_device != null ? s.sonar_in_device : -1);
@@ -617,7 +627,7 @@ function updateState(st){
   $("#stHand").dataset.tone = st.hand_found ? "good" : "warn";
   $("#kVers").textContent = st.version || "—";
   $("#kEng").textContent = st.engine_started ? "running" : "starting…";
-  $("#fVer").textContent = st.version || "2.4.5";
+  $("#fVer").textContent = st.version || "2.5.0";
   if (st.armed && st.hand_found) updateMeter(st.pinch_l, st.pinch_r, (st.settings && st.settings.click_threshold));
   updateSonarMeter(st.sonar, st.settings);
   if (st.settings && !dragging) applySettings(st.settings);
@@ -735,6 +745,9 @@ async function init(){
     const n = parseInt($("#sel-hands").value, 10);
     await api().set_setting("max_hands", n);   // engine reloads the landmarker live
   });
+  $("#sel-backend").addEventListener("change", async () => {
+    await api().set_setting("backend", $("#sel-backend").value);  // engine reloads live
+  });
   $("#sel-sonar-tone").addEventListener("change", async () => {
     await api().set_setting("sonar_tone", parseInt($("#sel-sonar-tone").value, 10));
   });
@@ -838,7 +851,7 @@ async function init(){
     try { const st = await api().get_state(); armed = !!st.armed; updateState(st); }
     catch(e){}
   }, 700);
-  updateState({armed:false, engine_started:false, hand_found:false, fps:0, latency_ms:0, infer_ms:0, version:"2.4.5", settings:Object.assign({}, DEFAULTS)});
+  updateState({armed:false, engine_started:false, hand_found:false, fps:0, latency_ms:0, infer_ms:0, version:"2.5.0", settings:Object.assign({}, DEFAULTS)});
 }
 
 if (window.pywebview) init();

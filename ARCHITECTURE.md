@@ -199,3 +199,27 @@ Tests: `test_cam_reader_times_out_not_hangs`, `test_engine_read_stall_recovers`
 abandon it, reopen and keep processing; the log shows "no frames for 0.8s —
 reopening (stall 1/3)"), `test_stall_decision_policy`,
 `test_engine_read_stall_wiring`.
+
+---
+
+## 14. 2.5.0 — GPU inference backend (ONNX Runtime + DirectML)
+
+MediaPipe's Windows pip build cannot use the GPU (its GPU path is compiled
+out: "GPU processing is disabled in build flags" — re-verified on mediapipe
+1.1.0), so the landmark stage ran ~7-10 ms on the CPU. 2.5.0 adds a second
+backend that reimplements the same two-stage hand pipeline on ONNX Runtime with
+the DirectML execution provider (any DX12 GPU):
+
+| Piece | What |
+|---|---|
+| Models | Converted the official weights with `tflite2onnx` (palm_detection_full + hand_landmark_lite → `handjob/assets/hand_onnx/*.onnx`; ~8 MB). Two converter bugs fixed locally (rank-vs-layout skips) and palm's SE-block PRelu slopes reshaped (1,1,C)→(1,C,1,1). **Numerics verified identical to the tflite runtime** (max abs diff ≤2e-4 on random and real inputs). |
+| `handjob/hand_onnx.py` | The ported pipeline: letterboxed 192 palm input (keep_aspect, zero border) → SSD decode at scale 192 relative to **unit anchors** (`fixed_anchor_size` sets w=h=1.0 — this is NOT the per-layer scale!), **linear** w/h decode (`apply_exponential_on_box_size` defaults false), **weighted NMS** (IoU .3, score-weighted box+kp averaging — MediaPipe's WEIGHTED algorithm), detection letterbox removal → crop per `palm_detection_detection_to_roi` (rotate so wrist kp0 → middle-MCP kp2 is "up", shift_y −0.5, square-long, ×2.6 → 224) → landmark model → inverse crop map. Landmark outputs are **[x,y,z] triples per point** (63 values, stride 3 — reading pairs garbles everything after the wrist). |
+| Parity | On MediaPipe's own test images (`thumb_up.jpg`) the backend matches the official expected landmarks **6.1 px mean / 12 px max** (mediapipe itself: 0.1 px). Landmark stage ~0.6 ms on DirectML vs ~7.5 ms CPU (palm ~0.7 ms). |
+| Integration | `settings.backend` ("auto" / "onnx" / "mediapipe"), System-card *Inference engine* select, live switch in the engine loop (`_backend_seen` → `_load_model`), `BACKEND` line in `--selftest`, fallback chain onnx → mediapipe on any load error. Custom `.task` models and 2-hand mode always use MediaPipe. |
+
+Known limits of the ONNX backend: palm acquisition can mislock on scenes with
+a strong hand-shaped shadow (reproduced on mediapipe's `pointing_up.jpg`,
+where the third-party pipeline finds the hand but ours locks the shadow
+region) — the landmark stage itself is exact once locked; multi-hand and
+custom models use the CPU engine. Default `backend: "auto"` keeps the
+verified CPU path one dropdown away.
