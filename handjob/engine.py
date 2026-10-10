@@ -851,13 +851,30 @@ class Engine(threading.Thread):
                 else:
                     req_use_cache = True
                 log.info("camera switch requested -> %s", req)
-                self._stop_reader()
-                self.capture = None
-                self.capture = self._open_bounded(req, use_cache=req_use_cache)
-                if self.capture is None:
+                # OPEN-FIRST swap: keep the old handle (and its reader thread)
+                # alive while the new one opens, then release the old. Virtual
+                # cams (Camo) AUTO-PAUSE when they see zero consumers and never
+                # un-pause by themselves — a release-then-open gap can kill a
+                # LIVE feed for good (observed: 10.5 new frames/s -> reopen ->
+                # 0.0 forever; that was the app's own doing, 2.4.0 had no
+                # reopens). Opening first means the vcam never sees a gap.
+                prev_capture = self.capture
+                newcap = self._open_bounded(req, use_cache=req_use_cache)
+                if newcap is None and prev_capture is not None and self._reader is not None:
+                    # e.g. a physical camera that refuses a second handle while
+                    # the old one is open: fall back to release-then-open
+                    self._stop_reader()
+                    self.capture = None
+                    newcap = self._open_bounded(req, use_cache=req_use_cache)
+                if newcap is None:
                     log.error("camera switch to %s failed", req)
                     self.bus.error = f"camera {req} unavailable"
+                    # an open-first failure leaves the old feed untouched (kept
+                    # above); only the release-first fallback can end up empty —
+                    # the stall watchdog restores it
                 else:
+                    self._stop_reader()          # stops + releases the OLD handle
+                    self.capture = newcap
                     self._cam_index = req
                     self._dedupe = True
                     self.bus.error = None
@@ -969,14 +986,22 @@ class Engine(threading.Thread):
                                                     "cover or Windows camera privacy settings; for a virtual "
                                                     "camera, check its source app (it may be paused or "
                                                     "disconnected)")
-                            elif _is_virtual_cam_name(name) or rrate > 40.0:
-                                self.bus.warning = (f"{did} isn't delivering video "
-                                                    f"(~{urate:.0f} new frames/s of {rrate:.0f} reads/s — reads "
-                                                    "only mean the driver answers, not that the picture "
-                                                    "changes). Its source app is paused, asleep, or the phone "
-                                                    "is disconnected: unpause / reconnect it (Camo, NVIDIA "
-                                                    "Broadcast, OBS). If it keeps happening with Camo, turn "
-                                                    "OFF its auto-pause option, or pick another camera")
+                            elif urate < 6.0:
+                                # A still scene and a paused source look IDENTICAL from
+                                # here (both send one unchanging frame) — say what is
+                                # actually observed and what each cause would mean.
+                                self.bus.warning = (f"{did}: the picture isn't changing (~{urate:.0f} new "
+                                                    "frames/s). Normal while the scene is genuinely still — if it "
+                                                    "stays frozen while you MOVE, the camera isn't delivering "
+                                                    "video: unpause / reconnect its source (Camo, NVIDIA "
+                                                    "Broadcast, OBS)"
+                                                    + (". For Camo also turn OFF its auto-pause option"
+                                                       if _is_virtual_cam_name(name) else ""))
+                            elif _is_virtual_cam_name(name):
+                                self.bus.warning = (f"{did} delivers only ~{urate:.0f} new frames/s — its source "
+                                                    "is updating slowly (phone on Wi-Fi / source app lagging); "
+                                                    "tracking moves at exactly that rate. A directly connected "
+                                                    "camera would be smoother")
                             else:
                                 self.bus.warning = (f"{did} delivers only ~{urate:.0f} new frames/s (tracking can't "
                                                     "be smoother than that). Usually dim light: add light, or open "
@@ -986,12 +1011,15 @@ class Engine(threading.Thread):
                         self._slow_cam_streak = 0
                         if self.bus.warning and "new frames/s" in self.bus.warning:
                             self.bus.warning = None
-                    if urate < 0.45 * rrate:
+                    if urate < 6.0 and urate < 0.45 * rrate:
                         self._uniq_bad_streak += 1
                         log.info("camera unique-frame rate %.1f of %.1f reads/s", urate, rrate)
                         # one chance per camera: reopen once in case the driver got into a
                         # stale-buffer state; a chronic repeater (virtual cam) can't be
                         # fixed by reopening — the pipeline now handles repeats instead.
+                        # NOTE the < 6.0 gate: a feed delivering ~10/s is WORKING — the
+                        # old '< 45% of reads' test alone fired on it, and the reopen
+                        # itself could kill a virtual cam (auto-pause on consumer loss).
                         if (self._frozen_streak < 2 and self._uniq_bad_streak >= 2
                                 and wnow - self._uniq_reopen_t > 120.0
                                 and self._uniq_reopened_cam != self._cam_index):
@@ -1003,15 +1031,20 @@ class Engine(threading.Thread):
                             self.request_camera(self._cam_index)
                     else:
                         self._uniq_bad_streak = 0
-                    # frozen source (virtual cam with a dead upstream): the cursor would
-                    # creep from landmark noise on a still image — halt it and say so
+                    # still-picture detection: INFORMATIONAL ONLY (2.5.5). From the
+                    # outside, a genuinely still scene and a paused/dead source are
+                    # indistinguishable (both send one unchanging frame), and the
+                    # duplicate gate already keeps stale frames out of the pipeline —
+                    # so this must never halt the cursor or raise an error. The old
+                    # halt+error read as "the app crashed" on a healthy camera the
+                    # moment the user stopped moving (and 2.4.0 never did that).
                     self._frozen_streak, faction = _frozen_cam_state(urate, self._frozen_streak)
-                    if faction == "error" and not (self.bus.error or "").startswith("camera frozen"):
-                        self.bus.error = FROZEN_ERR
-                        log.error("camera frozen: %.1f unique of %.1f reads/s — halting cursor", urate, rrate)
-                        self.motion.halt()
-                    elif faction == "clear" and (self.bus.error or "").startswith("camera frozen"):
-                        self.bus.error = None
+                    if faction == "error":
+                        log.info("camera %s: still picture (~%.1f new frames/s) — tracking resumes when "
+                                 "frames change", self._cam_index, urate)
+                    elif faction == "clear":
+                        if self.bus.warning and "picture isn't changing" in self.bus.warning:
+                            self.bus.warning = None
                         log.info("camera live again (%.1f new frames/s)", urate)
             if not first_frame_logged:
                 first_frame_logged = True

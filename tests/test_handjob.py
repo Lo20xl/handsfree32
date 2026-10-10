@@ -989,13 +989,17 @@ def test_frozen_cam_watchdog_state():
 
 
 def test_engine_frozen_wiring():
-    """The engine halts the cursor on frozen and clears on recovery."""
+    """2.5.5: a still picture must NEVER halt the cursor or raise an error —
+    a still scene and a paused source are indistinguishable from outside, and
+    the duplicate gate already keeps stale frames out of the pipeline. The
+    old halt+error made a healthy camera read as 'the app crashed' whenever
+    the user stopped moving (2.4.0 never did that)."""
     import handjob.engine as engmod
     src = open(engmod.__file__, encoding="utf-8").read()
     assert "_frozen_cam_state(urate, self._frozen_streak)" in src
-    assert "self.bus.error = FROZEN_ERR" in src and "self.motion.halt()" in src
-    assert "self._frozen_streak = 0" in src            # reset on camera switch
-    assert "self._frozen_streak < 2" in src            # reopen capped while frozen
+    assert "picture isn't changing" in src
+    assert "halting cursor" not in src
+    assert "self.bus.error = FROZEN_ERR" not in src
 
 
 # ------------------------------------------- 2.4.4 engine: repeat-frame dup gate ----
@@ -1605,6 +1609,10 @@ def test_camera_diagnostics_permanent():
     # the black check must run ABOVE the dup gate, or repeated black frames
     # (the exact paused-vcam case) are skipped before it executes
     assert src.index("dark_now = float") < src.index("_is_dup_sig(sig, self._last_proc_sig)")
+    # 2.5.5: reopens must never drop a live feed — open-first swap + a working
+    # (~10/s) feed must not trigger the repeat reopen
+    assert "OPEN-FIRST swap" in src
+    assert "urate < 6.0 and urate < 0.45 * rrate" in src
 
 
 def test_settings_21_keys():

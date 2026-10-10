@@ -1,9 +1,9 @@
 HandJob3000 — hand-gesture mouse control for Windows
 ======================================================
-Version 2.5.4  (x64, Windows 10/11)
+Version 2.5.5  (x64, Windows 10/11)
 
 INSTALL
-  1. Double-click  HandJob3000-Setup-2.5.4.exe
+  1. Double-click  HandJob3000-Setup-2.5.5.exe
   2. No administrator rights needed — it installs for the current user only
      (default: %LOCALAPPDATA%\Programs\HandJob3000, desktop shortcut optional).
   3. Launch HandJob3000 from the desktop or Start menu.
@@ -35,6 +35,20 @@ QUICK START
 
   The preview shows only the hand wireframe by default (no camera image).
   Switch it in the Camera card: Wireframe / Camera / Off.
+
+WHAT'S NEW IN 2.5.5
+  * No more false "camera frozen" — the app no longer halts the cursor or
+    shows an error when the picture simply stops changing. A genuinely still
+    scene and a paused camera source look identical from the outside, so the
+    app now just notes "the picture isn't changing" and keeps tracking the
+    moment anything moves. (This is what made a healthy camera feel like "it
+    crashes and lags" the second you stopped moving — 2.4.0 never did that.)
+  * Reopens can no longer kill a live feed: the new camera handle is opened
+    BEFORE the old one is released (virtual cameras pause when they see zero
+    viewers, and never un-pause by themselves — that's what a reopen used to
+    trigger). A failed switch now also leaves the previous camera running.
+  * A feed delivering ~10 new frames/s is treated as working (it is) — the
+    automatic "repeat" re-measure only fires below 6/s.
 
 WHAT'S NEW IN 2.5.3 - 2.5.4
   * Camera diagnostics that say what's actually wrong — and stop giving the

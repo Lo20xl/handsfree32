@@ -275,3 +275,24 @@ Trigger: user reports "camera blank / wrong advice". Root causes on the APP side
 
 Also shipped: `DEBUGGING.md` (full pipeline map + metrics + tool list) and
 `build/make_diagnostics_zip.sh` (regenerates the diagnostics bundle).
+
+---
+
+## 18. 2.5.5 — the "works 2 seconds then crashes/lags" compound
+
+User report (correct: "2.4.0 never did this"). Evidence: A/B probe against
+Camo (`build/cam_ab_probe.py`) — camera answers 60 reads/s; with motion it
+delivers **14 new frames/s (live!)**, on a still scene it sends one frame at
+60 reads/s (normal vcam behavior); MJPG-only opens can drop it to 1/s+black.
+The app manufactured its own disasters from a healthy feed:
+
+| Cause (app-side) | Fix |
+|---|---|
+| **Frozen-watchdog halted the cursor + raised "camera frozen" error** when the picture stopped changing. A still scene and a dead source are indistinguishable from outside; on a healthy camera this fired whenever the user stopped moving → "it crashes and lags". 2.4.0 had no such watchdog. | Still-picture detection is **informational only**: log + honest dual-case warning ("picture isn't changing — normal while the scene is still; if it stays frozen while you MOVE, the source isn't delivering"). Never halts, never errors. The duplicate gate already keeps stale frames out of the pipeline, so no landmark creep was possible anyway. |
+| **The one-chance reopen could KILL a live feed**: release-then-open created a zero-consumer moment; Camo auto-pauses on zero consumers and *never un-pauses by itself* (observed: 10.5 new frames/s → reopen → 0.0 forever). | **Open-first swap**: the replacement handle opens while the old reader still reads, then the old handle is released — the vcam never sees a gap. Failed switch = old feed keeps running. (Release-first only as fallback for single-consumer physical cams.) |
+| The repeat-reopen fired at a working ~10 new frames/s feed (threshold was `<45% of reads`). | Gate is now `urate < 6.0` **and** `<45% of reads`. |
+
+Also: all camera probes now run from the agent's own terminal (cameras are
+accessible cross-session; only overlay/desktop checks need the interactive
+session) — probe helper editors no longer flash console windows on the user's
+desktop during normal diagnostics.
