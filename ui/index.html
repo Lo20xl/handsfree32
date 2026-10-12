@@ -325,6 +325,10 @@
         <button class="switch" id="t-trail" aria-pressed="true"></button>
       </div>
       <div class="trow">
+        <div><div class="t-name">Native pointer (smoothest)</div><div class="t-desc">The orb / ring IS the Windows cursor — it can never lag or jitter against the pointer. Turn off to use the old overlay window.</div></div>
+        <button class="switch" id="t-native" aria-pressed="true"></button>
+      </div>
+      <div class="trow">
         <div><div class="t-name">Sparkles while dragging</div><div class="t-desc">Star particles while holding a left drag</div></div>
         <button class="switch" id="t-spark" aria-pressed="true"></button>
       </div>
@@ -350,11 +354,6 @@
         <div class="row-top"><label for="s-dz">Scroll dead-zone</label><span class="val" id="v-dz">0.003</span></div>
         <input type="range" id="s-dz" min="0.001" max="0.010" step="0.001" data-key="scroll_deadzone" data-fmt="f3">
         <div class="row-note">Hand wobble below this never scrolls. Raise it if the page scrolls on its own.</div>
-      </div>
-      <div class="row">
-        <div class="row-top"><label for="s-hold">Rest hold</label><span class="val" id="v-hold">2.5 px</span></div>
-        <input type="range" id="s-hold" min="0" max="8" step="0.5" data-key="hold_px" data-fmt="px">
-        <div class="row-note">Kills rest jitter: a still hand holds the cursor rock-steady, and the hold fades out as you move faster so quick motion keeps zero lag. 0 = off.</div>
       </div>
       <div class="row">
         <div class="row-top"><label for="s-edge">Edge hold margin</label><span class="val" id="v-edge">4%</span></div>
@@ -418,13 +417,13 @@
         <div class="row-note">Switches live in about a second. The list holds the bundled model plus every imported MediaPipe <b>.task</b> hand model; imports are validated before they are accepted.</div>
       </div>
       <div class="row" style="padding-top:13px">
-        <div class="row-top"><label for="sel-backend">Inference engine</label></div>
+        <div class="row-top"><label for="sel-backend">Inference backend</label></div>
         <select id="sel-backend">
-          <option value="auto">Auto — most accurate</option>
-          <option value="onnx">GPU — ONNX / DirectML (fastest, less precise)</option>
-          <option value="mediapipe">CPU — MediaPipe (full model)</option>
+          <option value="auto">Auto — MediaPipe (most accurate)</option>
+          <option value="onnx">ONNX / DirectML — ~3-6× faster</option>
+          <option value="mediapipe">MediaPipe — explicit</option>
         </select>
-        <div class="row-note">Auto uses MediaPipe's full model — the most accurate hand tracking here. The GPU engine is faster (~0.6 ms vs ~7.5 ms per frame) but runs the lighter model, and its landmark error grows with pose (measured: up to ~30 px off on some poses vs ~0.1 px for MediaPipe), which can read as jittery or wrong poses. Both fit comfortably at 60 fps; pick GPU only if you want the CPU load lower and can accept the drift.</div>
+        <div class="row-note"><b>ONNX</b> runs the same two-stage pipeline on your GPU via DirectML (~3 ms vs ~8 ms per frame) using a lighter landmark model — landmarks land within ~8 px of MediaPipe's. Pick it for speed; pick <b>Auto</b> for accuracy. A custom <em>.task</em> model or 2-hand mode always uses MediaPipe. If ONNX can't start (no DX12 GPU, missing runtime) the app falls back to MediaPipe on its own.</div>
       </div>
       <div class="row" style="padding-top:13px">
         <div class="row-top"><label for="sel-res">Processing size</label></div>
@@ -464,7 +463,7 @@
   </div>
 </main>
 
-<footer>HandJob3000 v<span id="fVer">2.5.9</span> — local only, nothing leaves your machine. Camera footage never leaves this app.</footer>
+<footer>HandJob3000 v<span id="fVer">2.6.0</span> — local only, nothing leaves your machine. Camera footage never leaves this app.</footer>
 
 <div class="overlay" id="telOverlay">
   <div class="dlg">
@@ -481,18 +480,17 @@
 <script>
 const $ = s => document.querySelector(s);
 const DEFAULTS = {camera_index:0, sensitivity:0.6, smoothing:0.55, click_threshold:0.28,
-                  prediction_ms:45, reanchor:true, drag_px:12, scroll_speed:1.0, hold_px:2.5,
+                  prediction_ms:45, reanchor:true, drag_px:12, scroll_speed:1.0,
                   scroll_deadzone:0.003, invert_scroll:false, cursor_style:"sky",
-                  trail:true, sparkles:true, preview_mode:"wireframe", capture_height:480,
+                  trail:true, sparkles:true, cursor_mode:"native", preview_mode:"wireframe", capture_height:480,
                   capture_fps:60, max_hands:1, edge_margin:0.04, sonar_enabled:false,
                   sonar_in_device:-1, sonar_out_device:-1, sonar_tone:19000,
-                  start_enabled:false, model_file:"", backend:"auto"};
+                  start_enabled:false, model_file:""};
 
 /* ---- API: real pywebview bridge, or a mock for plain-browser preview ---- */
 const mock = {
   _st:{armed:false, engine_started:true, hand_found:false, fps:0, latency_ms:0, infer_ms:0,
-       error:null, cursor_style:"sky", settings:Object.assign({}, DEFAULTS), version:"2.5.9",
-      sonar:{available:true, enabled:false, diag:{}, carrier_ok:null, note:null, error:null}},
+       error:null, cursor_style:"sky", settings:Object.assign({}, DEFAULTS), version:"2.6.0", sonar:null},
   get_settings(){ return Promise.resolve(Object.assign({}, this._st.settings)); },
   set_setting(k,v){ this._st.settings[k]=v; return Promise.resolve({ok:true, settings:Object.assign({}, this._st.settings)}); },
   reset_settings(){ this._st.settings=Object.assign({}, DEFAULTS); return Promise.resolve({ok:true, settings:Object.assign({}, this._st.settings)}); },
@@ -523,7 +521,7 @@ const fmt = {
   f3: v => v.toFixed(3),
 };
 const RANGE_IDS = {sensitivity:"s-sens", smoothing:"s-smooth", click_threshold:"s-thresh",
-                   scroll_speed:"s-scroll", prediction_ms:"s-pred", drag_px:"s-drag", hold_px:"s-hold",
+                   scroll_speed:"s-scroll", prediction_ms:"s-pred", drag_px:"s-drag",
                    scroll_deadzone:"s-dz", edge_margin:"s-edge"};
 const METER_MAX = 0.8;   // ratio scale shown on the pinch meter
 
@@ -546,6 +544,7 @@ function applySettings(s){
   $("#t-invert").setAttribute("aria-pressed", String(!!s.invert_scroll));
   $("#t-start").setAttribute("aria-pressed", String(!!s.start_enabled));
   $("#t-anchor").setAttribute("aria-pressed", String(s.reanchor !== false));
+  $("#t-native").setAttribute("aria-pressed", String(s.cursor_mode !== "overlay"));
   $("#t-sonar").setAttribute("aria-pressed", String(!!s.sonar_enabled));
   setMeterTick(s.click_threshold || 0.28);
   document.querySelectorAll("#segStyle button").forEach(b =>
@@ -555,7 +554,7 @@ function applySettings(s){
   if (s.capture_height) $("#sel-res").value = String(s.capture_height);
   if (s.capture_fps) $("#sel-fps").value = String(s.capture_fps);
   $("#sel-hands").value = String(s.max_hands || 1);
-  $("#sel-backend").value = s.backend || "auto";
+  if (s.backend) $("#sel-backend").value = String(s.backend);
   $("#sel-sonar-tone").value = String(s.sonar_tone || 19000);
   const pickDev = (sel, v) => { const o = sel.querySelector('option[value="' + v + '"]'); if (o) sel.value = String(v); };
   pickDev($("#sel-sonar-in"), s.sonar_in_device != null ? s.sonar_in_device : -1);
@@ -628,7 +627,7 @@ function updateState(st){
   $("#stHand").dataset.tone = st.hand_found ? "good" : "warn";
   $("#kVers").textContent = st.version || "—";
   $("#kEng").textContent = st.engine_started ? "running" : "starting…";
-  $("#fVer").textContent = st.version || "2.5.9";
+  $("#fVer").textContent = st.version || "2.6.0";
   if (st.armed && st.hand_found) updateMeter(st.pinch_l, st.pinch_r, (st.settings && st.settings.click_threshold));
   updateSonarMeter(st.sonar, st.settings);
   if (st.settings && !dragging) applySettings(st.settings);
@@ -647,15 +646,6 @@ function updateSonarMeter(so, s){
   if (!so){ stats.textContent = "starting…"; note.textContent = "Warming up the tone emitter and mic…"; return; }
   if (so.error){ stats.textContent = "unavailable"; note.textContent = so.error; fill.style.width = "0%"; return; }
   if (so.available === false){ stats.textContent = "no audio stack"; note.textContent = "sounddevice is not available in this build/session."; return; }
-  // The tone is running but the mic cannot hear it: a hardware limit, not a
-  // fault. Say so plainly instead of leaving a permanent 0.00 that reads as
-  // "the sonar is broken".
-  if (so.note){
-    stats.textContent = "tone inaudible";
-    note.textContent = so.note;
-    fill.style.width = "0%"; fill.classList.remove("hot"); val.textContent = "—";
-    return;
-  }
   const d = so.diag || {};
   if (d.blocks != null && d.blocks === 0){ stats.textContent = "listening…"; note.textContent = "First analysis block takes ~0.1 s…"; }
   const score = (d.score != null) ? d.score : null;
@@ -756,7 +746,9 @@ async function init(){
     await api().set_setting("max_hands", n);   // engine reloads the landmarker live
   });
   $("#sel-backend").addEventListener("change", async () => {
-    await api().set_setting("backend", $("#sel-backend").value);  // engine reloads live
+    // engine reloads the landmarker live (see _backend_seen); onnx->mediapipe
+    // if the ONNX stack can't start.
+    await api().set_setting("backend", $("#sel-backend").value);
   });
   $("#sel-sonar-tone").addEventListener("change", async () => {
     await api().set_setting("sonar_tone", parseInt($("#sel-sonar-tone").value, 10));
@@ -779,6 +771,12 @@ async function init(){
   bindToggle("t-start", "start_enabled");
   bindToggle("t-spark", "sparkles");
   bindToggle("t-anchor", "reanchor");
+  $("#t-native").addEventListener("click", async () => {
+    const el = $("#t-native");
+    const on = el.getAttribute("aria-pressed") !== "true";
+    el.setAttribute("aria-pressed", String(on));
+    await api().set_setting("cursor_mode", on ? "native" : "overlay");
+  });
 
   try { applySettings(await api().get_settings()); }
   catch(e){ applySettings(Object.assign({}, DEFAULTS)); }
@@ -861,7 +859,7 @@ async function init(){
     try { const st = await api().get_state(); armed = !!st.armed; updateState(st); }
     catch(e){}
   }, 700);
-  updateState({armed:false, engine_started:false, hand_found:false, fps:0, latency_ms:0, infer_ms:0, version:"2.5.9", settings:Object.assign({}, DEFAULTS)});
+  updateState({armed:false, engine_started:false, hand_found:false, fps:0, latency_ms:0, infer_ms:0, version:"2.6.0", settings:Object.assign({}, DEFAULTS)});
 }
 
 if (window.pywebview) init();

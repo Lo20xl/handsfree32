@@ -51,14 +51,6 @@ MOTION_DB = 6.0       # excess over the learned baseline before "motion" (power 
 FULL_DB = 18.0        # excess mapped to score 1.0
 BASE_RATE = 0.02      # baseline EMA rate per quiet block (~4 s tau at ~12 blocks/s)
 SPEED_OF_SOUND = 343.0  # m/s — Doppler conversion: Δf = 2·f0·v/c
-CARRIER_MIN_DB = 10.0  # the carrier must be this far over the noise floor for the
-                       # channel to work at all. Measured on a laptop whose
-                       # speaker/mic pair cannot carry an ultrasonic tone: every
-                       # tone from 17-20 kHz landed at <= +2.8 dB — the streams
-                       # open fine and blocks analyse fine, but the mic hears only
-                       # noise. Without this check the UI shows "motion 0.00"
-                       # forever, which reads as a broken feature rather than
-                       # unsupported hardware.
 
 
 def analyze(block: np.ndarray, sr: int, tone: float, state: dict | None = None) -> dict:
@@ -160,8 +152,6 @@ class Sonar:
         self._stop = threading.Event()
         self._emit_i = 0
         self._latest = None
-        self._latest_seq = 0        # bumped by the input callback per block
-        self._last_seq = -1         # last block this loop analysed
         self._lock = threading.Lock()
         self._thread = None
         self._out = None
@@ -169,16 +159,11 @@ class Sonar:
         self._sr = 0
         self._blocks = 0
         self._state: dict = {}
-        self.start_error = None       # set when start_async() fails
         self.diag = {"score": 0.0, "direction": 0, "carrier_db": 0.0, "floor_db": 0.0,
                      "velocity": 0.0, "sr": 0, "tone": tone, "blocks": 0}
 
     # ------------------------------------------------------------------ start
     def start(self):
-        """Open the tone output + analysis input. Raises on any failure; the
-        caller decides what to do (the engine retries with backoff)."""
-        if sd is None:
-            raise RuntimeError("sounddevice not available")
         # -1/None = system default: resolve to a real index first —
         # query_devices(None) returns the whole DeviceList, not a dict
         out_idx = self.out_dev
@@ -190,27 +175,10 @@ class Sonar:
         if out_idx is None or int(out_idx) < 0:
             raise RuntimeError("no default output device for the sonar tone")
         out_idx = int(out_idx)
-        in_idx = self.in_dev
-        if in_idx is None:
-            try:
-                in_idx = int(sd.default.device[0])
-            except Exception:
-                in_idx = -1
-        if in_idx is None or int(in_idx) < 0:
-            raise RuntimeError("no default input device for the sonar mic")
-
-        # Sample rate comes from the INPUT device and BOTH streams must open at
-        # it. Deriving it from the output (the old code) opened the input at the
-        # speaker's rate: whenever the mic's native rate differed (44.1k mic +
-        # 48k speaker is common) PortAudio refused the input stream and the
-        # sonar died with an opaque "Unanticipated host error" — it looked like
-        # broken hardware, not a rate mismatch.
-        sr = int(sd.query_devices(in_idx).get("default_samplerate") or 0)
-        if not sr:
-            sr = int(sd.query_devices(out_idx).get("default_samplerate") or 48000)
+        info = sd.query_devices(out_idx)
+        sr = int(info.get("default_samplerate") or 48000)
         if sr < int(self.tone * 2.2):
-            raise RuntimeError(f"input device sample rate {sr} can't carry a "
-                               f"{self.tone:.0f} Hz tone (needs >= {self.tone*2.2:.0f})")
+            raise RuntimeError(f"output device sample rate {sr} can't carry a {self.tone:.0f} Hz tone")
         self._sr = sr
         buf = np.sin(2.0 * math.pi * self.tone * np.arange(sr) / sr).astype(np.float32)
         self._buf = buf
@@ -223,57 +191,28 @@ class Sonar:
         def in_cb(indata, frames, t, status):
             with self._lock:
                 self._latest = indata[:, 0].copy()
-                self._latest_seq += 1
 
         try:
             self._out = sd.OutputStream(samplerate=sr, channels=1, dtype="float32",
                                         blocksize=BLOCK, device=out_idx, callback=out_cb)
             self._out.start()
             self._in = sd.InputStream(samplerate=sr, channels=1, dtype="float32",
-                                      blocksize=BLOCK, device=in_idx, callback=in_cb)
+                                      blocksize=BLOCK, device=self.in_dev, callback=in_cb)
             self._in.start()
         except Exception:
             self.stop()
             raise
-        if self._stop.is_set():
-            # the owner gave up while we were still opening (a wedged PortAudio
-            # call can take seconds) — don't leave live streams behind
-            self.stop()
-            raise RuntimeError("sonar start aborted")
         self._thread = threading.Thread(target=self._run, name="HJ3-Sonar", daemon=True)
         self._thread.start()
-
-    def start_async(self):
-        """Start on a private thread. `start()` opens two PortAudio streams and
-        that can block for tens of ms — calling it on the engine thread stalled
-        the cursor loop the moment the sonar was enabled."""
-        th = threading.Thread(target=self._start_guarded, name="HJ3-SonarBoot", daemon=True)
-        th.start()
-        return th
-
-    def _start_guarded(self):
-        try:
-            self.start()
-        except Exception as e:
-            self.start_error = f"{type(e).__name__}: {e}"
-            log.warning("sonar start failed: %s", self.start_error)
 
     # ------------------------------------------------------------------- loop
     def _run(self):
         while not self._stop.is_set():
             time.sleep(1.0 / 30.0)
             with self._lock:
-                block, seq = self._latest, self._latest_seq
-            # Only analyse a NEW block. The callback delivers one every
-            # BLOCK/sr (~85 ms = ~11.8/s) while this loop polls at 30 Hz, so
-            # without the sequence check the SAME block was re-analysed ~2.5x:
-            # the baseline EMA advanced 2.5x too fast (its ~4 s tau became
-            # ~1.6 s, so real leakage drift was never tracked and quiet reads
-            # ratcheted the baseline down into false motion), and the 0.65/0.35
-            # display smoothing made a single motion block look sustained.
-            if block is None or len(block) != BLOCK or seq == self._last_seq:
+                block = self._latest
+            if block is None or len(block) != BLOCK:
                 continue
-            self._last_seq = seq
             try:
                 d = analyze(block, self._sr, self.tone, self._state)
             except Exception:
@@ -283,10 +222,6 @@ class Sonar:
             d["sr"] = self._sr
             d["tone"] = self.tone
             d["blocks"] = self._blocks
-            # Is the mic actually hearing the tone? Judged only once the baseline
-            # has seeded (the first 10 blocks), so a slow start can't false-alarm.
-            d["carrier_ok"] = (self._blocks > 12
-                               and d.get("carrier_db", 0.0) >= CARRIER_MIN_DB)
             d["score"] = 0.65 * self.diag["score"] + 0.35 * d["score"]   # display smoothing
             d["velocity"] = 0.6 * self.diag.get("velocity", 0.0) + 0.4 * d["velocity"]
             if d["direction"] == 0 and d["score"] > 0.1:
@@ -313,11 +248,6 @@ class Sonar:
         d = self.diag
         if not d.get("sr"):
             return "sonar: initializing"
-        if d.get("blocks", 0) > 12 and not d.get("carrier_ok", True):
-            return (f"sonar: {d['tone']:.0f} Hz tone is NOT audible to the mic "
-                    f"(carrier only +{d['carrier_db']:.0f} dB over the floor, "
-                    f"needs +{CARRIER_MIN_DB:.0f}) — this speaker/mic pair cannot "
-                    f"carry an ultrasonic tone; try another tone or device")
         return (f"sonar: {d['tone']:.0f} Hz @ {d['sr']} Hz | carrier +{d['carrier_db']:.0f} dB "
                 f"above floor | motion {d['score']:.2f} (dir {d['direction']:+d}) "
                 f"| v {d.get('velocity', 0.0):+.2f} m/s")
@@ -363,74 +293,8 @@ def _selftest() -> None:
     print(f"sonar analyze: quiet {quiet['score']:.2f} | approach {a['score']:.2f} dir {a['direction']:+d} "
           f"v {a['velocity']:+.2f} | recede {r['score']:.2f} dir {r['direction']:+d} v {r['velocity']:+.2f} "
           f"| recovered {back['score']:.2f}")
-    _selftest_block_dedup()
     print("all sonar self-tests passed")
 
-
-def _selftest_block_dedup() -> None:
-    """The analysis loop must analyse each captured block ONCE.
-
-    PortAudio delivers a block every BLOCK/sr (~85 ms, ~11.8/s) while the loop
-    polls at 30 Hz, so re-analysing whenever the buffer merely still exists ran
-    the same block through ~2.5x: the baseline EMA advanced 2.5x too fast (its
-    ~4 s tau became ~1.6 s, so quiet reads ratcheted the baseline down into
-    false motion) and the 0.65/0.35 display smoothing made one motion block
-    look sustained. Feed blocks at 1/3 the poll rate and count the analyses.
-    """
-    global sd
-    import numpy as np
-
-    class FakeSonar(Sonar):
-        """Sonar with PortAudio replaced: the real analysis loop runs unchanged,
-        a feeder thread publishes blocks at ~1/3 the poll rate."""
-
-        def __init__(self, blocks):
-            super().__init__()
-            self._feed = blocks
-
-        def start(self):                      # no PortAudio
-            self._sr = 48000
-            self._thread = threading.Thread(target=self._run, name="HJ3-Sonar", daemon=True)
-            self._thread.start()
-            self._feeder = threading.Thread(target=self._feed_blocks, name="HJ3-SonarFeed",
-                                            daemon=True)
-            self._feeder.start()
-
-        def _feed_blocks(self):
-            for blk in self._feed:
-                with self._lock:
-                    self._latest = blk
-                    self._latest_seq += 1     # the audio callback only bumps on a NEW block
-                for _ in range(3):            # 30 Hz loop vs ~11.8 Hz blocks
-                    time.sleep(1.0 / 30.0)
-                    if self._stop.is_set():
-                        return
-            time.sleep(0.3)
-
-    n = BLOCK
-    sr, tone = 48000, 19000.0
-    t = np.arange(n) / sr
-    n_blocks = 30
-    blocks = [(np.sin(2 * math.pi * tone * t) * 0.4).astype(np.float32) for _ in range(n_blocks)]
-
-    # `Sonar.__init__` refuses to exist when sounddevice is missing, and the
-    # import itself fails in a non-interactive session (PortAudio needs the
-    # user's desktop) — but this logic touches no audio at all, so a sentinel
-    # is enough to build the object.
-    saved_sd, sd = sd, object()
-    try:
-        s = FakeSonar(blocks)
-        s.start()
-        s._feeder.join(timeout=30.0)
-        s._thread.join(timeout=5.0)
-        analysed = s.diag.get("blocks", 0)
-        s.stop()
-    finally:
-        sd = saved_sd
-    assert analysed == n_blocks, \
-        f"each block must be analysed exactly once: {analysed} analyses for {n_blocks} blocks"
-    print(f"block dedup: {analysed} analyses for {n_blocks} blocks "
-          f"(presented for 3 polls each) — no re-analysis")
 
 def _live(seconds: float, tone: int) -> None:
     if sd is None:

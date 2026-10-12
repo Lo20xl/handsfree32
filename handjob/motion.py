@@ -36,6 +36,7 @@ import math
 import sys
 import threading
 import time
+import statistics
 from collections import deque
 from typing import Callable, Optional, Tuple
 
@@ -86,15 +87,26 @@ class CursorMotion:
     REACQUIRE_GAP = 0.35      # s without samples -> next sample teleports the cursor
     RING_SPAN = 0.20          # s of smoothed samples kept for velocity estimation
     D_CUT = 2.0               # Hz, speed-estimate low-pass inside the 1-euro stage
-    V_DEAD = 60.0             # px/s of 'speed' treated as sensor noise (no cutoff boost)
+    V_DEAD = 60.0             # px/s floor of the noise dead band (the band itself is measured)
+    # noise-adaptive stage 1 (2.6): the sample noise is MEASURED (median |second difference|
+    # of the raw samples is insensitive to motion) and everything is derived from it:
+    #   * rest cutoff   : just heavy enough to land the rest jitter on J_SCALE*(0.25..2.25) px
+    #   * speed dead band: DEAD_K x the speed noise the estimator itself produces
+    #   * leash         : the filtered point never trails the raw one by more than LEASH x noise
+    # => lag is bounded by the noise itself (invisible), whatever the camera/lighting/distance.
+    AUTO_REST = True
+    J_SCALE = 0.5
+    DEAD_K = 2.2
+    LEASH = 3.0               # per-sample: |raw - filtered| never above LEASH x noise
+    LEASH_M = 1.5             # sustained: the MEAN innovation never above LEASH_M x noise (slow drift)
+    AM = 0.4                  # EMA gain of the mean innovation (~4-5 samples)
     ACC_EMA = 0.7             # smoothing of the braking estimate
     ACC_GAIN = 2.0            # assume braking continues harder than measured (anti-overshoot)
     LEAD_CAP_PX = 40.0        # soft ceiling on the lead distance (px at speed_scale=1)
 
     def __init__(self, prediction_ms: float = 45.0, smoothness: float = 0.5,
                  max_rate: float = 144.0, speed_scale: float = 1.0,
-                 clock: Callable[[], float] = time.perf_counter,
-                 hold_px: float = 0.0) -> None:
+                 clock: Callable[[], float] = time.perf_counter) -> None:
         self._clock = clock
         self._lock = threading.Lock()        # guards all motion state
         self._emit_lock = threading.Lock()   # serialises emission (emitter vs snap)
@@ -106,10 +118,7 @@ class CursorMotion:
 
         self._S = max(0.05, float(speed_scale))
         self._lead_cap = self.LEAD_CAP_PX
-        self._hold = 0.0
-        self._bx = self._by = 0.0            # hold-stage output (what is actually emitted)
-        self._b_ok = False
-        self.configure(prediction_ms, smoothness, max_rate, hold_px)
+        self.configure(prediction_ms, smoothness, max_rate)
 
         # --- sample state (local-clock times) ---
         self._ring: deque = deque(maxlen=5)  # (t, fx, fy) smoothed samples
@@ -123,30 +132,23 @@ class CursorMotion:
         self._t_o = 0.0
         self._last_px = None                 # last emitted whole-pixel pair
         self._pos: Optional[Tuple[float, float]] = None  # last emitted (x, y)
+        self._n2: deque = deque(maxlen=60)   # |second difference| of raw samples (noise gauge)
+        self._sigma = 0.0                    # measured per-axis sample noise in px (0 = unknown yet)
         self._ticks = self._late = 0
         self._gap_max = 0.0
 
     # ------------------------------------------------------------------ config
     def configure(self, prediction_ms: Optional[float] = None,
                   smoothness: Optional[float] = None,
-                  max_rate: Optional[float] = None,
-                  hold_px: Optional[float] = None) -> None:
-        """Live-tunable (safe to call from the UI thread).
-
-        hold_px : rest-hold radius (px at speed_scale=1). While the hand is slow, the
-                  emitted cursor only moves once the follower has drifted more than this
-                  from it, and then trails it at exactly this distance (a backlash /
-                  hysteresis stage). Sub-noise wobble never reaches the screen; the
-                  radius collapses to 0 as speed rises, so deliberate motion has no lag.
-                  0 disables (legacy behaviour)."""
+                  max_rate: Optional[float] = None) -> None:
+        """Live-tunable (safe to call from the UI thread)."""
         with self._lock:
-            if hold_px is not None:
-                self._hold = max(0.0, min(20.0, float(hold_px)))
             if prediction_ms is not None:
                 self._lead = max(0.0, min(0.20, prediction_ms / 1000.0))
             if smoothness is not None:
                 s = min(1.0, max(0.0, float(smoothness)))
-                self._fc_min = 8.0 * (0.1 ** (1.15 * s))      # 8 Hz -> ~0.6 Hz at rest
+                self._fc_min = 8.0 * (0.1 ** (1.15 * s))      # 8 Hz -> ~0.6 Hz at rest (AUTO_REST off)
+                self._jstar = self.J_SCALE * (0.25 + 2.0 * (1.0 - s) ** 1.2)   # rest-jitter target, px
                 self._beta = 0.10 - 0.04 * s                  # cutoff gain per px/s
                 self._ff_min = 24.0 - 10.0 * s                # follower cutoff at rest (Hz)
             if max_rate is not None:
@@ -218,7 +220,6 @@ class CursorMotion:
                 self._have_out = True
                 self._soft = True
                 self._halted = False
-                self._bx, self._by, self._b_ok = float(x), float(y), True
                 self._wake.set()
             self._emit(float(x), float(y))
 
@@ -231,8 +232,7 @@ class CursorMotion:
             if not self._have_out or self._halted:
                 return
             self._halted = True
-            x, y = self._bx if self._b_ok else self._ox, self._by if self._b_ok else self._oy
-            self._ox, self._oy = x, y
+            x, y = self._ox, self._oy
             self._reset_samples()
             self._rx = self._fx = x
             self._ry = self._fy = y
@@ -257,6 +257,8 @@ class CursorMotion:
         self._gi = self._gl = 0.0            # interpolation / lead gates
         self._dt_ema = 1.0 / 30.0
         self._off = None                     # local - caller clock offset (min-filtered)
+        self._rx2 = self._ry2 = None         # raw sample before the previous one
+        self._mx = self._my = 0.0            # EMA of (raw - filtered): sustained one-sided error = real motion
 
     def _ingest_locked(self, t: float, x: float, y: float, local: float) -> None:
         S = self._S
@@ -291,13 +293,38 @@ class CursorMotion:
         self._t_prev, self._t_s = t, t_loc
         self._dt_ema += 0.25 * (min(0.25, max(0.005, dt)) - self._dt_ema)
 
-        # 1) speed-adaptive 1-euro smoothing of the raw sample (2D, magnitude-driven cutoff)
+        # 1) noise-adaptive 1-euro smoothing of the raw sample (2D, magnitude-driven cutoff)
+        if self._rx2 is not None:
+            self._n2.append(math.hypot(x - 2.0 * self._rx + self._rx2, y - 2.0 * self._ry + self._ry2))
+            if len(self._n2) >= 12:
+                self._sigma = max(0.15 * S, statistics.median(self._n2) / 2.88)
+        self._rx2, self._ry2 = self._rx, self._ry
+        sig = self._sigma if self._sigma > 0.0 else 1.5 * S
         ad = _lp(self.D_CUT, dt)
         self._dx += ad * ((x - self._rx) / dt - self._dx)
         self._dy += ad * ((y - self._ry) / dt - self._dy)
-        ex = math.hypot(self._dx, self._dy) / S - self.V_DEAD     # noise-floor dead band
-        fc = self._fc_min + (self._beta * ex if ex > 0.0 else 0.0)
+        if self.AUTO_REST:
+            r = min(1.0, max(0.12, self._jstar * S / sig))          # wanted rest jitter / measured noise
+            a_t = min(0.95, 2.0 * r * r / (1.0 + r * r))            # EMA gain that yields exactly that
+            fc_rest = min(12.0, max(0.3, -math.log(1.0 - a_t) / (_TWO_PI * dt)))
+        else:
+            fc_rest = self._fc_min
+        v_noise = 1.414 * sig / dt * math.sqrt(ad / (2.0 - ad))     # speed noise the estimator makes
+        dead = max(0.25 * self.V_DEAD * S, self.DEAD_K * v_noise)
+        ex = math.hypot(self._dx, self._dy) - dead
+        fc = fc_rest + (self._beta * ex if ex > 0.0 else 0.0)
         a = _lp(fc, dt)
+        eps = math.hypot(x - self._fx, y - self._fy)                # leash: lag never exceeds ~LEASH x noise
+        lim = self.LEASH * sig
+        if eps > lim:
+            a = max(a, 1.0 - lim / eps)
+        # slow drift: noise averages out of the MEAN innovation, a real move does not -> catch up early
+        self._mx += self.AM * ((x - self._fx) - self._mx)
+        self._my += self.AM * ((y - self._fy) - self._my)
+        em = math.hypot(self._mx, self._my)
+        lim_m = self.LEASH_M * sig
+        if em > lim_m:
+            a = max(a, 1.0 - lim_m / em)
         self._fx += a * (x - self._fx)
         self._fy += a * (y - self._fy)
         self._rx, self._ry = x, y
@@ -410,23 +437,7 @@ class CursorMotion:
             if abs(tx - self._ox) < 0.08 and abs(ty - self._oy) < 0.08:
                 self._ox, self._oy = tx, ty
                 quiet = True
-        if self._hold <= 0.0:
-            return self._ox, self._oy, quiet
-        # 8) rest hold (backlash): emit a point that trails the follower at <= r px.
-        #    r is full while the hand is slow and fades to 0 between 1x and 3x the sensor
-        #    noise speed, so a still hand is rock steady and a moving hand has no lag.
-        if not self._b_ok:
-            self._bx, self._by, self._b_ok = self._ox, self._oy, True
-        r = self._hold * self._S * (1.0 - _smoothstep(self.V_DEAD * self._S, 3.0 * self.V_DEAD * self._S, sp))
-        if p > 0.0:
-            r = 0.0                                   # samples stopped on purpose: land exactly
-        ddx, ddy = self._ox - self._bx, self._oy - self._by
-        dd = math.hypot(ddx, ddy)
-        if dd > r:
-            k = (dd - r) / dd
-            self._bx += ddx * k
-            self._by += ddy * k
-        return self._bx, self._by, quiet and dd <= r + 1e-6
+        return self._ox, self._oy, quiet
 
     def advance(self, now: float):
         """Thread-safe single step (used by the emitter; handy for tests)."""
@@ -684,6 +695,25 @@ def _selftest() -> None:
             tick += 1 / 150.0
     assert np.std(out) < 0.55 * np.std(raw), (np.std(out), np.std(raw))
     print(f"(d) rest jitter    : {np.std(raw):.2f}px in -> {np.std(out):.2f}px out")
+
+    # ---- (e) noise-adaptive: steady at rest AND bounded lag in slow motion, for any camera noise ----
+    for sigma in (1.5, 4.5, 9.0):
+        rn = random.Random(int(sigma * 10))
+        clk = Clk()
+        m = CursorMotion(smoothness=0.55, clock=clk)
+        ts, xs, _ = simulate(m, clk, lambda t: (500.0 + rn.gauss(0, sigma), 400.0 + rn.gauss(0, sigma)),
+                             jittery_caps(5.0, jit=0.1, seed=4), latency=0.03, t_end=5.0)
+        rest = float(np.std(xs[ts > 1.5]))
+        clk = Clk()
+        m = CursorMotion(smoothness=0.55, clock=clk)
+        v0 = 150.0                                           # slow deliberate move, px/s
+        ts, xs, _ = simulate(m, clk, lambda t: (100.0 + v0 * t + rn.gauss(0, sigma), 400.0 + rn.gauss(0, sigma)),
+                             jittery_caps(5.0, jit=0.1, seed=4), latency=0.03, t_end=5.0)
+        sel = ts > 1.5
+        lag_px = float(np.mean((100.0 + v0 * (ts[sel] + 0.03)) - xs[sel]))     # vs where the hand is NOW
+        assert rest < 0.12 * sigma + 0.75, (sigma, rest)
+        assert abs(lag_px) < 3.2 * sigma + 12.0, (sigma, lag_px)
+        print(f"(e) noise {sigma:3.1f}px   : rest jitter {rest:.2f}px, slow-move lag {lag_px:+.1f}px ({lag_px / v0 * 1000:+.0f} ms)")
 
     # ---- threads: real clock, real emitter ------------------------------------
     got = []

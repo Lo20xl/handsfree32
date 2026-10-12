@@ -252,11 +252,6 @@ class ClickRefiner:
                 self._end_lock(now, 0.3, 0.10)
             else:
                 return ax, ay
-        # NOTE: a release blend must NOT be cancelled here just because a new
-        # press started — `_start_lock` already clears it, and this same field
-        # carries the drag-UNLOCK ease, which has to survive while the button is
-        # held. Cancelling on `engaged` made the unlock jump straight to the live
-        # hand position (caught by the self-test: "target jumped on unlock").
         if self._blend is not None:
             ax, ay, t0, s0, dur = self._blend
             s = s0 + (1.0 - s0) * min(1.0, (now - t0) / dur)

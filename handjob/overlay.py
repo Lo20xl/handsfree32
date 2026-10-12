@@ -412,7 +412,7 @@ class Overlay(threading.Thread):
         super().__init__(daemon=True, name="HJ3-Overlay")
         self.bus = bus
         self.fps = fps
-        self._stop = threading.Event()
+        self._halt_evt = threading.Event()   # NOT `_stop`: that shadows threading.Thread._stop() and breaks join()
         self._hwnd = None
         self._visible = False
         self._rect = None          # DIB rect (x0, y0, x1, y1) currently holding pixels
@@ -420,7 +420,7 @@ class Overlay(threading.Thread):
         self.last_frame_ms = 0.0   # diagnostics: CPU time of the last frame
 
     def stop(self):
-        self._stop.set()
+        self._halt_evt.set()
         try:
             self.bus.visual_event.set()
         except Exception:
@@ -551,12 +551,12 @@ class Overlay(threading.Thread):
         last_sig = None
         animating = False
         loop_errors = 0
-        while not self._stop.is_set():
+        while not self._halt_evt.is_set():
             # sleep until the emitter says the cursor moved; while a trail / ripple
             # is fading we also tick on a timer so the animation keeps running
             ev.wait(0.016 if animating else 0.08)
             ev.clear()
-            if self._stop.is_set():
+            if self._halt_evt.is_set():
                 break
             dt = time.perf_counter() - last
             if dt < min_dt:

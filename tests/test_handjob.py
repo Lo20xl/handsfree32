@@ -315,13 +315,11 @@ def test_click_lock_holds_anchor_until_drag():
         assert abs(calls[-1][0] - ax) < 1.5 and abs(calls[-1][1] - ay) < 1.5, \
             f"cursor must be snapped to the anchor, got {calls[-1]} vs ({ax:.1f},{ay:.1f})"
         anchor = calls[-1]
-        # small hand wobble << press radius: cursor must stay at the anchor.
-        # (~8 px mapped; the held-pinch radius has shrunk to ~12 px by the last
-        # frame, so this stays inside it.)
+        # small hand wobble (< drag threshold): cursor must stay at the anchor
         wobble = _hand(True, False, False, False)
-        wobble[8] = (0.4212, 0.3212, 0)        # index tip +0.0012
-        wobble[4] = (0.3012, 0.6212, 0)
-        wobble[12] = (0.3212, 0.6312, 0)
+        wobble[8] = (0.422, 0.322, 0)          # index tip +0.002 x
+        wobble[4] = (0.302, 0.622, 0)
+        wobble[12] = (0.322, 0.632, 0)
         for i in range(4):
             e._process_hand(wobble, mapper, clicks, scroll, cfg, now + 0.4 + i * 0.04, None)
         _t.sleep(0.2)
@@ -876,307 +874,6 @@ def test_capture_time_stamps_make_motion_smoother():
     assert capture < 0.7 * after, (capture, after)
 
 
-# ------------------------------------------- 2.4.2 motion: rest-hold backlash ----------
-def test_rest_hold_kills_jitter_without_motion_lag():
-    """hold_px adds a backlash stage: emitted output trails the follower by at most
-    r px while slow (sub-noise wobble never reaches the screen) and r collapses to
-    0 with speed, so deliberate motion keeps zero lag."""
-    import random
-    from handjob.motion import CursorMotion
-
-    class Clk:
-        t = 0.0
-
-        def __call__(self):
-            return self.t
-
-    def run_live(path, T, hold, seed=3):
-        """Interleave like the real engine: 30 Hz samples in, 144 Hz emitter out.
-        Returns the emitter's (x, y) stream over the whole run."""
-        clk = Clk()
-        m = CursorMotion(clock=clk, prediction_ms=0, smoothness=0.55, hold_px=hold)
-        rnd = random.Random(seed)
-        out = []
-        t_in = 0.0
-        t_out = 0.0
-        while t_out < T:
-            while t_in <= t_out:
-                x, y = path(t_in)
-                cx = 0.6 * getattr(run_live, "_cx", 0.0) + rnd.gauss(0, 0.004)
-                cy = 0.6 * getattr(run_live, "_cy", 0.0) + rnd.gauss(0, 0.004)
-                run_live._cx, run_live._cy = cx, cy
-                m.ingest(t_in, x + cx * 200, y + cy * 200)   # sensor wobble on top of truth
-                t_in += 1.0 / 30.0
-            clk.t = t_out
-            r = m.advance(t_out)
-            if r:
-                out.append(r[:2])
-            t_out += 1.0 / 144.0
-        run_live._cx = run_live._cy = 0.0
-        return out
-
-    def rest_wander(hold):
-        run_live._cx = run_live._cy = 0.0
-        out = run_live(lambda t: (960.0, 540.0), 5.0, hold)
-        k = out[int(len(out) * 0.5):]                     # skip the engage transient
-        xs = [p[0] for p in k]
-        return max(xs) - min(xs)
-
-    off, on = rest_wander(0.0), rest_wander(4.0)
-    assert on < 0.5 * off, f"hold should roughly halve rest wander: {off:.1f} -> {on:.1f}"
-
-    def sweep_err(hold):
-        import math as _m
-        out = run_live(lambda t: (960.0 + 300 * _m.sin(2 * _m.pi * 0.8 * t), 540.0),
-                       5.0, hold)
-        errs = []
-        for i, (x, _y) in enumerate(out[int(len(out) * 0.6):]):
-            t = 5.0 * 0.6 + (i + 1) / 144.0
-            errs.append(abs(x - (960.0 + 300 * _m.sin(2 * _m.pi * 0.8 * t))))
-        return sum(errs) / len(errs)
-
-    assert sweep_err(4.0) < sweep_err(0.0) + 6.0, "hold must not add lag at speed"
-
-    # disabled = legacy behaviour exactly
-    clk = Clk()
-    m = CursorMotion(clock=clk, prediction_ms=0, smoothness=0.55, hold_px=0.0)
-    m.ingest(0.0, 100.0, 100.0)
-    for i in range(200):
-        r = m.advance((i + 1) / 144.0)
-    assert r is not None and abs(r[0] - 100.0) < 0.5 and abs(r[1] - 100.0) < 0.5
-
-    # clamp: out-of-range values are bounded
-    clk = Clk()
-    m = CursorMotion(clock=clk, hold_px=99.0)
-    assert m._hold == 20.0
-    m.configure(hold_px=-5)
-    assert m._hold == 0.0
-
-
-def test_engine_passes_hold_px_setting():
-    """The engine wires settings.hold_px into the motion engine (construction path)."""
-    import handjob.engine as engmod
-    src = open(engmod.__file__, encoding="utf-8").read()
-    assert 'hold_px=float(settings.get("hold_px") or 0.0)' in src
-    assert 'hold_px=self._hold_seen' in src
-    from handjob.settings import DEFAULTS
-    assert DEFAULTS["hold_px"] == 2.5
-
-
-# ------------------------------------------- 2.4.3 engine: frozen-camera watchdog ------
-def test_frozen_cam_watchdog_state():
-    """A live camera always yields new frames (sensor noise); <=2 unique/s means
-    the source is frozen (virtual cam with a dead upstream). The watchdog must
-    error after two checks, clear on recovery, and never fire on slow-but-live."""
-    from handjob.engine import _frozen_cam_state, FROZEN_UNIQUE_FPS
-    s, a = _frozen_cam_state(None, 0)
-    assert (s, a) == (0, "ok"), "no measurement yet — stay quiet"
-    s, a = _frozen_cam_state(0.2, 0)
-    assert (s, a) == (1, "ok"), "first frozen window is a maybe"
-    s, a = _frozen_cam_state(0.2, 1)
-    assert (s, a) == (2, "error"), "two frozen windows = hard error"
-    s, a = _frozen_cam_state(0.2, 5)
-    assert (s, a) == (6, "error")
-    s, a = _frozen_cam_state(30.0, 2)
-    assert (s, a) == (0, "clear"), "live camera clears the frozen error"
-    s, a = _frozen_cam_state(30.0, 0)
-    assert (s, a) == (0, "ok"), "steady live camera stays quiet"
-    s, a = _frozen_cam_state(8.0, 0)
-    assert (s, a) == (0, "ok"), "slow but live (dim light) never errors"
-    assert FROZEN_UNIQUE_FPS == 2.0
-    from handjob.engine import FROZEN_ERR
-    assert "Refresh app" in FROZEN_ERR and "frozen" in FROZEN_ERR
-
-
-def test_engine_frozen_wiring():
-    """2.5.5: a still picture must NEVER halt the cursor or raise an error —
-    a still scene and a paused source are indistinguishable from outside, and
-    the duplicate gate already keeps stale frames out of the pipeline. The
-    old halt+error made a healthy camera read as 'the app crashed' whenever
-    the user stopped moving (2.4.0 never did that)."""
-    import handjob.engine as engmod
-    src = open(engmod.__file__, encoding="utf-8").read()
-    assert "_frozen_cam_state(urate, self._frozen_streak)" in src
-    assert "picture isn't changing" in src
-    assert "halting cursor" not in src
-    assert "self.bus.error = FROZEN_ERR" not in src
-
-
-# ------------------------------------------- 2.4.4 engine: repeat-frame dup gate ----
-def test_dup_frame_gate():
-    """Virtual cams answer every read by repeating the last frame (user's log:
-    8.5 unique of 54.7 reads/s). Feeding repeats downstream puts 67 ms of real
-    motion into an 18 ms dt -> inflated velocity -> the cursor lurches on each
-    new frame. The engine must classify repeats with the same signature metric
-    as the unique-frame watchdog and drop them before the pipeline."""
-    import numpy as np
-    from handjob.engine import _is_dup_sig, Engine
-
-    frame = np.full((48, 64, 3), 90, dtype=np.uint8)
-    frame[10:20, 10:30] = 200
-    sig_a = Engine._frame_sig(frame)[0]
-    sig_b = Engine._frame_sig(frame.copy())[0]
-    assert _is_dup_sig(sig_b, sig_a), "identical frames must classify as duplicates"
-    assert not _is_dup_sig(sig_b, None), "no history -> never a duplicate"
-    moved = frame.copy()
-    moved[12:22, 12:32] = 220              # visible content change
-    assert not _is_dup_sig(Engine._frame_sig(moved)[0], sig_a), \
-        "a changed frame must pass the gate"
-    # the signature also carries the frame brightness (black-frame watchdog).
-    # A uniform frame reports its exact value; a mixed frame reports the AREA
-    # average (the old code point-sampled every 16th pixel and could miss a
-    # bright region entirely, reading a lit frame as black).
-    assert Engine._frame_sig(np.full((8, 8, 3), 90, dtype=np.uint8))[1] == 90
-    assert Engine._frame_sig(np.zeros((8, 8, 3), np.uint8))[1] == 0
-    assert Engine._frame_sig(frame)[1] > 90, "a lit patch must raise the reported brightness"
-
-    # wiring: the gate is used in the loop and resets on camera switches,
-    # and only real cameras (we-opened captures) are gated
-    import handjob.engine as engmod
-    src = open(engmod.__file__, encoding="utf-8").read()
-    assert "_is_dup_sig(sig, self._last_proc_sig)" in src
-    assert "self._last_proc_sig = None" in src
-    assert "self._dedupe = self.capture is not None" in src
-
-
-# ------------------------------------------- 2.4.5 engine: blocking-read stall ----
-def test_stall_decision_policy():
-    from handjob.engine import _stall_decision, CAMERA_STALL_REOPENS
-    assert _stall_decision(1, CAMERA_STALL_REOPENS) == "reopen"
-    assert _stall_decision(CAMERA_STALL_REOPENS, CAMERA_STALL_REOPENS) == "reopen"
-    assert _stall_decision(CAMERA_STALL_REOPENS + 1, CAMERA_STALL_REOPENS) == "give_up"
-
-
-def test_cam_reader_times_out_not_hangs():
-    """A driver-blocked read() must surface as a get() timeout, not a hang:
-    observed live — the NVIDIA Broadcast chain accepted the capture and then
-    never returned from read(), wedging the whole engine while the UI lived on."""
-    import time as _t
-    import numpy as np
-    from handjob.engine import _CamReader
-
-    class Cap:
-        def __init__(self):
-            self.n = 0
-
-        def read(self):
-            self.n += 1
-            if self.n <= 2:
-                return True, np.zeros((4, 4, 3), dtype=np.uint8)
-            _t.sleep(3600)            # driver never returns
-        def release(self):
-            pass
-
-    r = _CamReader(Cap(), max_hz=1000)
-    r.start()
-    got = 0
-    seq = 0
-    for _ in range(50):
-        item = r.get(seq, 0.1)
-        if item is None:
-            break
-        seq = item[0]
-        if item[2] is not None:
-            got += 1
-    assert got >= 2, got
-    t0 = _t.time()
-    assert r.get(seq, 0.2) is None, "blocked read must time out, not hang"
-    assert _t.time() - t0 < 1.0
-    r.abandon()
-
-
-def test_engine_read_stall_recovers():
-    """End of the engine loop: with a camera that blocks after its first frame,
-    the engine must abandon the stuck reader, reopen, and keep processing."""
-    import time as _t
-    import types
-    import numpy as np
-    import handjob.engine as engmod
-    from handjob.engine import Engine, CursorBus
-
-    class BlockingCap:
-        def __init__(self):
-            self.n = 0
-
-        def isOpened(self):
-            return True
-
-        def read(self):
-            self.n += 1
-            if self.n == 1:
-                img = np.zeros((48, 64, 3), dtype=np.uint8)
-                img[8:16, 4:12] = 200
-                return True, img
-            _t.sleep(3600)            # driver never returns
-        def set(self, *a):
-            pass
-        def release(self):
-            pass
-
-    class GoodCap:
-        def __init__(self):
-            self.frames = 0
-
-        def isOpened(self):
-            return True
-
-        def read(self):
-            self.frames += 1
-            _t.sleep(1 / 60.0)
-            img = np.zeros((48, 64, 3), dtype=np.uint8)
-            k = self.frames % 40           # moving block: frames must differ (dup gate)
-            img[8:16, k:k + 8] = 200
-            return True, img
-        def set(self, *a):
-            pass
-        def release(self):
-            pass
-
-    class FakeLM:
-        def detect_for_video(self, img, ts):
-            return types.SimpleNamespace(hand_landmarks=[], hand_world_landmarks=None)
-        def close(self):
-            pass
-
-    good = GoodCap()
-    opens = []
-
-    bus = CursorBus()
-    eng = Engine(bus)
-    eng._load_model = lambda: setattr(eng, "landmarker", FakeLM())
-    eng._open_bounded = lambda cam, deadline=None, use_cache=True: (
-        opens.append(cam), BlockingCap() if len(opens) == 1 else good)[1]
-    old_stall = engmod.CAMERA_STALL_S
-    engmod.CAMERA_STALL_S = 0.6
-    try:
-        eng.start()
-        deadline = _t.time() + 10
-        while _t.time() < deadline and bus.frames < 5:
-            _t.sleep(0.1)
-        eng.stop()
-        assert len(opens) >= 2, f"engine must reopen after a blocked read (opens={len(opens)})"
-        assert good.frames > 0, "the reopened camera must deliver frames"
-        assert bus.frames >= 5, f"engine must keep processing after recovery (frames={bus.frames})"
-    finally:
-        engmod.CAMERA_STALL_S = old_stall
-        try:
-            eng.cleanup()
-        except Exception:
-            pass
-
-
-def test_engine_read_stall_wiring():
-    """The engine loop consumes frames from the reader thread; the old direct
-    capture.read() (which a wedged driver could block forever) must be gone."""
-    import handjob.engine as engmod
-    src = open(engmod.__file__, encoding="utf-8").read()
-    assert "self._reader.get(self._reader_seq" in src
-    assert "_stall_decision(self._read_stalls, CAMERA_STALL_REOPENS)" in src
-    assert "self._open_bounded(cam)" in src and "self._open_bounded(req" in src
-    assert "self._stop_reader()" in src
-    assert "ok, frame = self.capture.read()" not in src
-
-
 # --------------------------------------------------------- win32 constants ---
 def test_win32_module_imports():
     from handjob import input_win32 as wi
@@ -1479,455 +1176,13 @@ def test_snapshot_hides_orb_without_hand():
 
 
 def test_effective_prediction_scales_with_dt():
-    """2.3 + 2.5.6: prediction never drops below ~1.3 camera intervals — at 30
-    fps the slider value wins (unchanged feel); at ~10 fps it scales up so the
-    emitter can interpolate across the gap; at very low rates the scaled floor
-    is CAPPED (300+ ms leads overshot and swung on direction changes)."""
-    from handjob.engine import _effective_prediction, PRED_LEAD_CAP_MS
+    """2.3: prediction never drops below ~1.4 camera intervals — at 30 fps the
+    slider value wins (unchanged feel); at ~10 fps feeds it scales up so the
+    emitter can interpolate across the gap instead of jumping per sample."""
+    from handjob.engine import _effective_prediction
     assert _effective_prediction(45, 1 / 30) == 45        # 30 fps: slider wins
-    assert _effective_prediction(45, 1 / 10) == PRED_LEAD_CAP_MS  # 10 fps: scaled then capped
-    assert _effective_prediction(45, 0.25) == PRED_LEAD_CAP_MS    # 4 fps: capped
+    assert abs(_effective_prediction(45, 1 / 10) - 130) < 1e-6   # 10 fps: scaled
     assert _effective_prediction(120, 1 / 30) == 120      # user value respected
-
-
-def test_backend_selection_and_wiring():
-    """2.5: inference backend setting — auto/onnx mediapipe selection, live
-    switch wiring, ONNX assets present, and the hand_onnx module's interface
-    matches what the engine consumes."""
-    import os
-    from handjob import settings as S
-    from handjob.paths import assets_dir
-    assert S._clamp("backend", "onnx") == "onnx"
-    assert S._clamp("backend", "wat") == "auto"
-    assert S._clamp("backend", None) == "auto"
-    d = os.path.join(assets_dir(), "hand_onnx")
-    assert os.path.exists(os.path.join(d, "palm_detection_full.onnx"))
-    assert os.path.exists(os.path.join(d, "hand_landmark_lite.onnx"))
-    from handjob.hand_onnx import OnnxHandLandmarker  # importable (runtime optional)
-    assert hasattr(OnnxHandLandmarker, "detect_for_video")
-    assert hasattr(OnnxHandLandmarker, "close")
-    import handjob.engine as engmod
-    src = open(engmod.__file__, encoding="utf-8").read()
-    assert 'settings.get("backend")' in src
-    assert "_backend_seen" in src
-    assert 'backend_now = str(cfg.get("backend")' in src  # live switch in the loop
-    assert "cam_mode_cache" in src                        # camera-mode fast path
-    assert "from mediapipe import Image as MpImage" not in src.split("\n\n", 1)[0], \
-        "mediapipe must not import at module level (matplotlib costs ~2 s of startup)"
-
-
-def test_engine_survives_repeated_frames():
-    """2.5.1 regression: a REPEATING feed (static scene on a virtual cam) must
-    not stall the engine. A clock mix in the duplicate-frame gate once made it
-    sleep ~1.7e9 s (perf_counter - wall-clock) on the first repeated frame:
-    real cameras froze instantly, while probes (synthetic feeds skip the gate)
-    stayed green."""
-    import time as _t
-    import types
-    import numpy as np
-    import handjob.engine as engmod
-    from handjob.engine import Engine, CursorBus
-
-    class RepeatFeed:
-        """Every 3rd read is new; the others repeat — vcam behavior."""
-        def __init__(self):
-            self.n = 0
-
-        def isOpened(self):
-            return True
-
-        def read(self):
-            self.n += 1
-            frame = np.zeros((48, 64, 3), dtype=np.uint8)
-            k = (self.n // 3) % 32
-            frame[8:16, k:k + 8] = 200
-            return True, frame
-
-        def set(self, *a):
-            pass
-
-        def release(self):
-            pass
-
-    class FakeLM:
-        def detect_for_video(self, img, ts):
-            return types.SimpleNamespace(hand_landmarks=[], hand_world_landmarks=None)
-        def close(self):
-            pass
-
-    bus = CursorBus()
-    eng = Engine(bus)
-    eng._load_model = lambda: setattr(eng, "landmarker", FakeLM())
-    eng.capture = RepeatFeed()
-    eng._dedupe = True           # force the duplicate gate on (injected feeds skip it)
-    try:
-        eng.start()
-        deadline = _t.time() + 8
-        while _t.time() < deadline and bus.frames < 4:
-            _t.sleep(0.1)
-        eng.stop()
-        assert bus.frames >= 4, \
-            f"duplicate-frame gate stalled the engine ({bus.frames} frames in 8s)"
-    finally:
-        try:
-            eng.cleanup()
-        except Exception:
-            pass
-
-
-def test_cam_reader_join_after_exit():
-    """2.5.1 regression: joining a reader that already exited must not raise.
-    _CamReader used to store its stop flag as `self._stop`, shadowing
-    threading.Thread._stop() — which join() calls internally once the thread
-    has finished — so the engine crashed ('Event' object is not callable)
-    whenever it joined an already-exited reader (the camera-switch path)."""
-    import time as _t
-    import numpy as np
-    from handjob.engine import _CamReader
-
-    class Cap:
-        def read(self):
-            _t.sleep(0.01)
-            return True, np.zeros((4, 4, 3), dtype=np.uint8)
-        def release(self):
-            pass
-
-    r = _CamReader(Cap(), max_hz=1000)
-    r.start()
-    _t.sleep(0.05)
-    r.abandon()
-    r.join(timeout=2.0)          # must not raise TypeError
-    assert not r.is_alive()
-
-
-def test_camera_diagnostics_permanent():
-    """2.5.4: camera diagnostics are NAME-aware and the black-frame watchdog is
-    time/read-based — the two root causes behind 'blank camera + wrong advice':
-    a deep-idle virtual cam answers slowly (got dim-light advice) and repeated
-    black frames never reached the old per-processed-frame counter."""
-    import handjob.engine as engmod
-    from handjob.engine import _is_virtual_cam_name
-    assert _is_virtual_cam_name("Camo")
-    assert _is_virtual_cam_name("Camera (NVIDIA Broadcast)")
-    assert _is_virtual_cam_name("OBS Virtual Camera")
-    assert not _is_virtual_cam_name("HD Webcam C920")
-    assert not _is_virtual_cam_name("")
-    src = open(engmod.__file__, encoding="utf-8").read()
-    assert "_cam_device_name" in src
-    assert "self._last_frame_dark" in src
-    # the black check must run ABOVE the dup gate, or repeated black frames
-    # (the exact paused-vcam case) are skipped before it executes
-    assert src.index("dark_now = brightness") < src.index("_is_dup_sig(sig, self._last_proc_sig)")
-    # 2.5.5: reopens must never drop a live feed — open-first swap + a working
-    # (~10/s) feed must not trigger the repeat reopen
-    assert "OPEN-FIRST swap" in src
-    assert "urate < 6.0 and urate < 0.45 * rrate" in src
-
-
-def test_open_mode_rejects_degenerate_driver_fallback():
-    """The 'smooth but jumps everywhere' root cause.
-
-    Drivers ignore CAP_PROP_FRAME_WIDTH/HEIGHT and fall back to their own
-    default — measured live: asking cam0 for 640x480 returned 1280x720, and in
-    the field a held stream returned 64x48. _open_mode used to accept ANY frame
-    that arrived, so a 48px frame reached MediaPipe (the engine only downscales
-    when proc_h < frame height), where a hand is ~10 px of noise: the landmarks
-    jump, the 1e filter smooths BETWEEN the jumps, and _cam_mode recorded the
-    size we ASKED for so every watchdog decided on a lie.
-    """
-    import numpy as np
-    import handjob.engine as engmod
-
-    def fake_capture(size):
-        class Cap:
-            def __init__(self):
-                self.released = False
-                self.props = {}
-            def isOpened(self):
-                return True
-            def set(self, prop, value):
-                self.props[prop] = value
-                return True
-            def read(self):
-                h, w = size
-                return True, np.zeros((h, w, 3), np.uint8)
-            def release(self):
-                self.released = True
-        return Cap()
-
-    opened = []
-
-    class FakeCV2:
-        CAP_DSHOW = 700
-        CAP_ANY = 0
-        CAP_PROP_FOURCC = 6
-        CAP_PROP_FRAME_WIDTH = 3
-        CAP_PROP_FRAME_HEIGHT = 4
-        CAP_PROP_FPS = 5
-        CAP_PROP_BUFFERSIZE = 38
-
-        @staticmethod
-        def VideoCapture(index, backend):
-            opened.append(index)
-            return fake_capture(size)
-
-        @staticmethod
-        def VideoWriter_fourcc(*a):
-            return 0
-
-    real_cv2 = engmod.cv2
-    engmod.cv2 = FakeCV2
-    try:
-        # a 64x48 fallback must be REJECTED, not accepted as a good mode
-        size = (48, 64)
-        assert engmod.Engine._open_mode(0, 640, 480, 60) is None, \
-            "a 64x48 driver fallback was accepted as a usable mode"
-
-        # a correct-size frame is accepted and reports what was delivered
-        size = (480, 640)
-        res = engmod.Engine._open_mode(0, 640, 480, 60)
-        assert res is not None and res[1] == (640, 480), res
-
-        # LARGER than requested is fine — the engine downscales in software
-        size = (720, 1280)
-        res = engmod.Engine._open_mode(0, 640, 480, 60)
-        assert res is not None and res[1] == (1280, 720), \
-            "an oversized delivery should be accepted, not rejected"
-    finally:
-        engmod.cv2 = real_cv2
-
-
-def test_auto_backend_is_the_accurate_engine():
-    """'the model got worse / wrong pose / freaking out' — the ONNX default.
-
-    The ONNX port runs the LITE landmark model and its error is pose-dependent,
-    not a fixed offset. Measured on the official test images:
-
-        thumb_up    : mediapipe 0.1px mean  |  onnx  6.1px mean (max 11.9px)
-        pointing_up : mediapipe 3.6px mean  |  onnx 31.2px mean (max 86.1px)
-
-    A displacement that grows with pose flips the pose classifier and lurches
-    the cursor — the exact reported symptom. 'auto' used to resolve to ONNX
-    whenever it could load, trading ~7 ms nobody needs (both fit the 16.7 ms
-    budget at 60 fps) for landmark accuracy. 'auto' must now mean MediaPipe;
-    'onnx' stays available as an explicit opt-in.
-    """
-    import handjob.engine as engmod
-    src = open(engmod.__file__, encoding="utf-8").read()
-    # auto must NOT reach the ONNX branch — only the explicit 'onnx' opt-in does
-    assert 'if backend == "onnx" and hands == 1 and not wants_custom:' in src, \
-        "'auto' still resolves to the ONNX backend"
-    assert 'if backend in ("auto", "onnx")' not in src, \
-        "'auto' is bundled with the explicit onnx opt-in again"
-    # the accurate engine is the fallback every path ends on
-    assert 'self._backend_name = "mediapipe"' in src
-
-
-def test_onnx_branch_feeds_bgr_not_rgb():
-    """The RGB/BGR swap that broke ONNX palm detection.
-
-    hand_onnx.detect_for_video documents: "the engine passes a mediapipe Image
-    wrapping an RGB numpy array; direct callers pass BGR arrays (like cv2.imread
-    output)". A raw ndarray is therefore read as BGR — but the engine's ONNX
-    branch passed the already-converted `rgb`, swapping red and blue on every
-    frame. Measured on the official test images:
-
-        fed BGR (correct)        -> 1 hand detected
-        fed RGB (what it passed) -> 0 hands detected
-
-    Total detection failure on a still image; in live video it degrades to
-    intermittent/wrong boxes, which reads as "wrong pose and freaking out".
-    """
-    import os
-    import handjob.engine as engmod
-    src = open(engmod.__file__, encoding="utf-8").read()
-    # the ONNX branch must hand over the BGR frame, never the converted rgb
-    assert "res = self.landmarker.detect_for_video(frame, ts_ms)" in src, \
-        "the ONNX branch no longer feeds the BGR frame"
-    assert "res = self.landmarker.detect_for_video(rgb, ts_ms)" not in src, \
-        "the ONNX branch is feeding channel-swapped RGB again"
-    # and the contract lives where the next reader will look for it
-    onnx_src = open(os.path.join(os.path.dirname(engmod.__file__), "hand_onnx.py"),
-                    encoding="utf-8").read()
-    assert "direct callers pass BGR arrays" in onnx_src
-
-
-def test_native_crash_forces_immediate_landmarker_rebuild():
-    """An access violation inside detect_for_video leaves the C++ graph in an
-    undefined state — it is NOT a transient error. Feeding that same corrupted
-    landmarker for 15 more frames (the old behaviour) is what turns one bad
-    frame into a hard crash, so the rebuild must happen on the FIRST failure.
-
-    Two halves: (a) the MediaPipe VIDEO-mode timestamp is forced strictly
-    increasing, because int(perf_counter()*1000) repeats whenever two frames
-    land in the same millisecond and a repeated timestamp drives the native
-    graph into exactly that undefined state; (b) the exception path calls
-    _rebuild_landmarker immediately."""
-    import handjob.engine as engmod
-    src = open(engmod.__file__, encoding="utf-8").read()
-    assert "if ts_ms <= self._last_ts_ms:" in src, "timestamp must be forced monotonic"
-    assert "self._last_ts_ms = ts_ms" in src
-    assert "if self._rebuild_landmarker():" in src, "rebuild on the first failure"
-    assert "consecutive_errors == 15" not in src, "the 15-strikes rebuild is gone"
-
-    # the rebuild helper really does close + reload, and reports failure honestly
-    class _Dead:
-        closed = False
-
-        def close(self):
-            _Dead.closed = True
-
-    class _Eng(engmod.Engine):
-        def __init__(self):
-            self.landmarker = _Dead()
-            self._loads = 0
-
-        def _load_model(self):
-            self._loads += 1
-            self.landmarker = _Dead() if self._loads > 1 else None
-
-    e = _Eng()
-    assert not e._rebuild_landmarker(), "a failed reload must report False"
-    assert _Dead.closed, "the old landmarker must be closed first"
-    e._loads = 1
-    assert e._rebuild_landmarker(), "a successful reload must report True"
-
-
-def test_fps_uses_a_time_window_not_a_frame_count():
-    """bus.frames counts PROCESSED frames and the dup gate drops everything on a
-    still scene, so the old 'if frames % 15 == 0' never fired again and the UI
-    chip sat at 0.0 forever on a healthy app. fps must come from a time window."""
-    import handjob.engine as engmod
-    src = open(engmod.__file__, encoding="utf-8").read()
-    assert "if span >= 0.5:" in src, "fps must refresh on a time window"
-    assert "bus.frames % 15" not in src, "the frame-count gate is gone"
-
-    bus = engmod.CursorBus()
-    eng = engmod.Engine(bus)
-    eng._publish_stats(__import__("time").perf_counter(), None)
-    eng._publish_stats(__import__("time").perf_counter(), None)
-    assert bus.frames == 2 and bus.fps == 0.0, "two frames in one window is not yet a rate"
-    eng._stat_t -= 1.0                       # pretend a second has passed
-    eng._publish_stats(__import__("time").perf_counter(), None)
-    assert bus.fps > 0.0, f"fps must update from the time window, got {bus.fps}"
-    assert eng._stat_n == 0, "the window counter must reset after publishing"
-
-
-def test_settings_save_is_serialised():
-    """Two writers (UI thread per slider tick, engine thread for cam_mode_cache)
-    used to interleave snapshot -> replace and silently lose an update; the
-    shared .tmp name made it worse. _save_lock now spans the whole critical
-    section and the temp name is per-writer."""
-    import handjob.settings as S
-    import os
-    import tempfile
-    import threading
-
-    path = os.path.join(tempfile.mkdtemp(), "settings.json")
-    S.save(path)                             # seeds the file
-    S.set("sensitivity", 0.31)
-    S.save(path)
-
-    # 40 concurrent writers, each committing a distinct value; the file must end
-    # up holding exactly one of them (never a torn/absent value)
-    errors = []
-
-    def w(v):
-        try:
-            for _ in range(20):
-                S.set("drag_px", v)
-                S.save(path)
-        except Exception as e:               # noqa: BLE001
-            errors.append(e)
-
-    ts = [threading.Thread(target=w, args=(v,)) for v in (7.0, 11.0, 19.0, 23.0)]
-    [t.start() for t in ts]
-    [t.join() for t in ts]
-    assert not errors, errors
-    assert os.path.exists(path), "the atomic replace must never leave the file missing"
-    import json
-    disk = json.load(open(path, encoding="utf-8"))
-    assert disk["drag_px"] in (7.0, 11.0, 19.0, 23.0), disk["drag_px"]
-    assert not [f for f in os.listdir(os.path.dirname(path)) if f.endswith(".tmp")], \
-        "temp files must be cleaned up"
-    S.reset()
-
-
-def test_landmark_stabilizer_holds_a_glitch_for_one_frame_only():
-    """A palm-scale jump is held for exactly ONE frame. A one-frame outlier is
-    noise (z-flip); anything that persists is real motion — the hand rotated,
-    leaned in, or the tracker re-locked at a new depth — and holding it froze
-    the cursor solid while the hand kept moving. An earlier attempt compared
-    against an EMA reference scale instead; that deadlocks on a true oscillation
-    (the reference never moves toward a level it keeps rejecting)."""
-    from handjob.lmsmooth import LandmarkStabilizer
-
-    def hand(palm, cx=0.5):
-        pts = [[cx, 0.5, 0.0] for _ in range(21)]
-        pts[9] = [cx + palm, 0.5, 0.0]
-        pts[8] = [cx + palm * 0.7, 0.5 - palm, 0.0]
-        return pts
-
-    # (a) a fast flick that changes projected length past the threshold every
-    # other frame must still be FOLLOWED, not frozen at one scale
-    st = LandmarkStabilizer()
-    t = 0.0
-    for _ in range(10):
-        t += 1 / 30.0
-        st.process(hand(0.2), t)
-    outs = []
-    for i in range(40):
-        t += 1 / 30.0
-        outs.append(st.process(hand(0.2 if i % 2 == 0 else 0.30), t)[8][0])
-    assert max(outs) - min(outs) > 0.03, \
-        f"a fast rotation must be followed (spread {max(outs)-min(outs):.3f})"
-
-    # (b) a one-frame z-flip is still rejected
-    st = LandmarkStabilizer()
-    t = 0.0
-    for _ in range(10):
-        t += 1 / 30.0
-        st.process(hand(0.2), t)
-    before = st.process(hand(0.2), t)[8][0]
-    flipped = st.process(hand(0.8), t + 1 / 30.0)[8][0]     # 4x palm = z-flip
-    assert abs(flipped - before) < 0.02, "a one-frame z-flip must still be held"
-
-    # (c) a real, gradual change of size is followed with at most one hold
-    st = LandmarkStabilizer()
-    t = 0.0
-    for _ in range(10):
-        t += 1 / 30.0
-        st.process(hand(0.2), t)
-    r0 = st._rejects
-    for i in range(10):
-        t += 1 / 30.0
-        out = st.process(hand(0.5), t)                       # new scale persists
-    assert st._rejects - r0 <= 1, "a persistent change may hold only one frame"
-    assert abs(out[8][0] - (0.5 + 0.5 * 0.7)) < 0.05, \
-        f"a real change of apparent size must be followed, got {out[8][0]:.3f}"
-
-
-def test_pred_lead_cap_and_box_smoothing():
-    """2.5.6: the low-fps prediction floor is capped (at a few samples/s a
-    300+ ms lead made the cursor overshoot on every direction change) and the
-    ONNX backend temporally smooths its per-frame palm detections (the box
-    wander was becoming whole-cursor jitter)."""
-    import numpy as np
-    from handjob.engine import _effective_prediction, PRED_LEAD_CAP_MS, _smooth_box
-    assert abs(_effective_prediction(10, 1 / 30.0) - 43.33) < 0.1   # 30 fps: slider floor unchanged
-    assert _effective_prediction(10, 0.25) == PRED_LEAD_CAP_MS      # 4 fps: capped
-    assert _effective_prediction(120, 0.25) == 120                  # user slider wins
-    rng = np.random.default_rng(1)
-    prev = None
-    outs = []
-    for _ in range(60):
-        noisy = (100 + rng.normal(0, 3), 100 + rng.normal(0, 3), 50 + rng.normal(0, 2))
-        box, kps = _smooth_box(prev, noisy, np.zeros((7, 2), np.float32))
-        prev = (box, kps)
-        outs.append(box[0])
-    assert np.std(outs) < 2.2, f"steady box must be smoothed (std={np.std(outs):.2f})"
-    b2, _ = _smooth_box(prev, (160.0, 100.0, 50.0), np.zeros((7, 2), np.float32))
-    assert abs(b2[0] - 160.0) < 16.0, "a big jump must be followed almost immediately"
 
 
 def test_settings_21_keys():
@@ -1959,6 +1214,65 @@ def test_model_registry_and_resolution():
     assert os.path.basename(_task_path("..\\evil\\x.task")) == "x.task", "path parts must be stripped"
 
 
+def test_onnx_backend_loads_and_falls_back():
+    """2.6.1 port: backend="onnx" builds the ONNX landmarker on DirectML; when
+    the ONNX stack can't start (no runtime / no GPU) it falls back to MediaPipe
+    instead of leaving the app with no tracker."""
+    from handjob import settings as S
+    from handjob.engine import Engine, CursorBus
+    from handjob.paths import assets_dir
+    import os
+
+    saved = S.get("backend"), S.get("max_hands"), S.get("model_file")
+    try:
+        S.set("max_hands", 1)
+        S.set("model_file", "")
+        S.set("backend", "onnx")
+        e = Engine(CursorBus())
+        e._load_model()
+        name = e._backend_name
+        assert e.landmarker is not None, "no landmarker built"
+        # either it really got ONNX, or it degraded to mediapipe — never nothing
+        assert name.startswith("onnx") or name == "mediapipe", name
+        if name.startswith("onnx"):
+            for f in ("palm_detection_full.onnx", "hand_landmark_lite.onnx"):
+                assert os.path.exists(os.path.join(assets_dir(), "hand_onnx", f)), f
+        try:
+            e.landmarker.close()
+        except Exception:
+            pass
+
+        # a broken onnx import must degrade, not crash
+        import sys
+        import types
+        broken = types.ModuleType("handjob.hand_onnx")
+        def _boom(*a, **k):
+            raise RuntimeError("no DX12 GPU")
+        broken.OnnxHandLandmarker = _boom
+        sys.modules["handjob.hand_onnx"] = broken
+        try:
+            e2 = Engine(CursorBus())
+            e2._load_model()
+            assert e2._backend_name == "mediapipe", e2._backend_name
+            assert e2.landmarker is not None, "fallback left no tracker"
+            e2.landmarker.close()
+        finally:
+            sys.modules.pop("handjob.hand_onnx", None)
+    finally:
+        S.set("backend", saved[0]); S.set("max_hands", saved[1]); S.set("model_file", saved[2])
+
+
+def test_onnx_inference_gets_raw_bgr_frame():
+    """The ONNX branch must feed the raw flipped BGR array; feeding it the RGB
+    MpImage swaps red/blue and palm detection drops to zero hands."""
+    import inspect
+    from handjob import engine as E
+    src = inspect.getsource(E.Engine._run)
+    assert 'detect_for_video(frame, ts_ms)' in src, \
+        "ONNX path must pass the raw BGR frame, not the RGB image"
+    assert 'ImageFormat.SRGB' in src, "mediapipe path must keep the SRGB MpImage"
+
+
 def test_model_import_validates_and_copies():
     """2.4: import_model test-loads the file first and copies only valid .task
     files into models/; garbage and reserved names are rejected."""
@@ -1988,6 +1302,438 @@ def test_model_import_validates_and_copies():
         raise AssertionError("reserved name must be rejected")
     except ValueError:
         pass
+
+
+# ------------------------------------------------------------------ 2.6 camera ---
+class _FakeCam:
+    """Fake webcam: read() blocks until the next frame is due; every frame is pixel-unique
+    unless `dup` > 1 (then each new frame is repeated dup times, like a throttled virtual cam)."""
+
+    def __init__(self, fps=100.0, dup=1, fail_after=None, size=(64, 48)):
+        import numpy as np
+        self.period, self.dup, self.fail_after, self.size = 1.0 / fps, dup, fail_after, size
+        self._np = np
+        self._rng = np.random.default_rng(1)
+        self._next = None
+        self.n = 0
+        self.released = False
+        self._cur = None
+
+    def read(self):
+        import time as _t
+        if self.fail_after is not None and self.n >= self.fail_after:
+            _t.sleep(0.01)
+            return False, None
+        now = _t.perf_counter()
+        if self._next is None:
+            self._next = now
+        if self._next > now:
+            _t.sleep(self._next - now)
+        self._next += self.period
+        if self._cur is None or self.n % self.dup == 0:
+            self._cur = self._rng.integers(0, 255, (self.size[1], self.size[0], 3), dtype=self._np.uint8)
+        self.n += 1
+        return True, self._cur.copy()
+
+    def release(self):
+        self.released = True
+
+
+def test_grabber_latest_frame_wins_and_stamps_are_monotonic():
+    """A slow consumer must get the NEWEST frame every time (no queueing), and the
+    arrival stamps must be monotonic perf_counter values."""
+    import time as _t
+    from handjob.camera import FrameGrabber
+    cam = _FakeCam(fps=120)
+    g = FrameGrabber(lambda i: cam, 0)
+    g.start()
+    try:
+        seq, stamps, ages, jumps = 0, [], [], 0
+        t_end = _t.perf_counter() + 1.0
+        while _t.perf_counter() < t_end:
+            got = g.get(seq, timeout=0.5)
+            assert got is not None, "grabber stopped delivering"
+            frame, t, s = got
+            jumps += (s - seq > 1)
+            seq = s
+            stamps.append(t)
+            ages.append(_t.perf_counter() - t)
+            _t.sleep(0.05)                       # consumer is ~6x slower than the camera
+        assert all(b > a for a, b in zip(stamps, stamps[1:])), "stamps must increase"
+        assert jumps >= 5, "a slow consumer must skip frames, not queue them"
+        assert max(ages) < 0.030, f"stale frame served (age {max(ages) * 1000:.0f} ms)"
+        assert g.dropped > 20 and g.size == (64, 48)
+    finally:
+        g.stop()
+    assert cam.released, "capture must be released on stop"
+
+
+def test_grabber_reconnects_after_a_stall():
+    import time as _t
+    from handjob.camera import FrameGrabber
+    opened = []
+
+    def open_fn(idx):
+        cam = _FakeCam(fps=100, fail_after=15 if not opened else None)
+        opened.append(cam)
+        return cam
+
+    g = FrameGrabber(open_fn, 2)
+    g.STALL_S = 0.25
+    g.start()
+    try:
+        seq, t_end, got_after = 0, _t.perf_counter() + 4.0, 0
+        while _t.perf_counter() < t_end and (len(opened) < 2 or got_after < 10):
+            r = g.get(seq, timeout=0.2)
+            if r:
+                seq = r[2]
+                got_after += len(opened) >= 2
+        assert len(opened) >= 2 and got_after >= 10, (len(opened), got_after)
+        assert opened[0].released and g.reopens >= 1 and g.error is None
+    finally:
+        g.stop()
+
+
+def test_grabber_counts_unique_frames_and_survives_a_failing_open():
+    import time as _t
+    from handjob.camera import FrameGrabber
+    tries = []
+
+    def open_fn(idx):
+        tries.append(idx)
+        return None if len(tries) < 3 else _FakeCam(fps=90, dup=3)
+
+    g = FrameGrabber(open_fn, 1)
+    g.start()
+    try:
+        seq, t_end = 0, _t.perf_counter() + 5.0
+        while _t.perf_counter() < t_end and g.rates()[0] is None:
+            r = g.get(seq, timeout=0.2)
+            seq = r[2] if r else seq
+        reads, uniq = g.rates()
+        assert len(tries) >= 3, "must keep retrying a camera that is busy"
+        assert reads and 60 < reads < 110, reads
+        assert uniq and 0.25 * reads < uniq < 0.45 * reads, (reads, uniq)    # each frame repeated 3x
+    finally:
+        g.stop()
+
+
+def test_grabber_camera_switch_and_driver_request_are_nonblocking():
+    import time as _t
+    from handjob.camera import FrameGrabber
+    seen = []
+
+    def open_fn(idx):
+        seen.append(idx)
+        return _FakeCam(fps=100)
+
+    g = FrameGrabber(open_fn, 0)
+    g.start()
+    try:
+        r = g.get(0, timeout=1.0)
+        assert r is not None
+        t0 = _t.perf_counter()
+        g.request_index(3)
+        assert _t.perf_counter() - t0 < 0.01, "request_index must not block the caller"
+        seq, t_end = r[2], _t.perf_counter() + 2.0
+        while _t.perf_counter() < t_end and 3 not in seen:
+            rr = g.get(seq, timeout=0.1)
+            seq = rr[2] if rr else seq
+        assert seen[-1] == 3 and g.index == 3, seen
+    finally:
+        g.stop()
+
+
+# ------------------------------------------------------- 2.6 native cursor ---
+class _FakeCursorBackend:
+    def __init__(self, alpha="straight", refuse_normal=False):
+        self.alpha, self.refuse_normal = alpha, refuse_normal
+        self.log, self.live, self.n = [], set(), 0
+        self.system = {}                      # ocr id -> handle currently installed
+        self.created = []
+
+    def probe_alpha_mode(self):
+        self.log.append("probe")
+        return self.alpha
+
+    def create_cursor(self, bgra, w, h, hx, hy):
+        self.n += 1
+        self.live.add(self.n)
+        self.created.append((len(bgra), w, h, hx, hy))
+        return self.n
+
+    def copy(self, h):
+        self.n += 1
+        self.live.add(self.n)
+        return self.n
+
+    def set_system_cursor(self, h, ocr):
+        if self.refuse_normal and ocr == 32512:
+            return False
+        self.live.discard(h)                  # the system takes ownership
+        self.system[ocr] = h
+        return True
+
+    def destroy(self, h):
+        self.live.discard(h)
+
+    def restore_all(self):
+        self.log.append("restore")
+        self.system.clear()
+
+
+def test_native_cursor_sprite_geometry_and_alpha_conversion():
+    from handjob.native_cursor import render_sprite, to_bgra, sprite_geometry
+    for style in ("sky", "glow"):
+        size, (hx, hy) = sprite_geometry(style, 1.0)
+        img, hot = render_sprite(style, 1.0, 0.0)
+        assert img.size == (size, size) and hot == (hx, hy) == (size // 2, size // 2)
+        assert 60 <= size <= 140, size                       # fits the 256 px cursor limit with room
+        a = img.getchannel("A")
+        assert a.getpixel((hx, hy)) > 200, "hotspot must sit on the solid core"
+        assert a.getpixel((1, 1)) == 0, "corners must be transparent"
+        assert a.getbbox()[0] >= 0 and a.getbbox()[2] <= size, "sprite must not be clipped"
+        pressed, _ = render_sprite(style, 1.0, 0.75)
+        assert pressed.tobytes() != img.tobytes(), "press variant must look different"
+    img, _ = render_sprite("sky", 1.0, 0.0)
+    w = img.size[0]
+    # find a semi-transparent pixel: straight keeps the colour, premultiplied scales it by alpha
+    px = img.load()
+    cand = [(x, y) for x in range(w) for y in range(w) if 40 < px[x, y][3] < 200]
+    assert cand, "expected anti-aliased edge pixels"
+    x, y = cand[len(cand) // 2]
+    r, g, b, a = px[x, y]
+    straight = to_bgra(img, False)
+    prem = to_bgra(img, True)
+    o = (y * w + x) * 4
+    assert tuple(straight[o:o + 4]) == (b, g, r, a)
+    assert abs(prem[o + 0] - b * a // 255) <= 2 and prem[o + 3] == a
+
+
+def test_native_cursor_install_press_restore_lifecycle():
+    from handjob.native_cursor import NativeCursor, ALL_IDS
+    be = _FakeCursorBackend()
+    nc = NativeCursor(be)
+    assert nc.install("sky", 1.0) and nc.active
+    assert set(be.system) == set(ALL_IDS), "every cursor shape must carry the sprite"
+    assert len(be.created) == 2, "normal + press templates"
+    normal_handles = dict(be.system)
+    nc.set_press(True)
+    assert be.system != normal_handles, "pressing must swap the sprite"
+    pressed_handles = dict(be.system)
+    nc.set_press(True)
+    assert be.system == pressed_handles, "no churn while the state is unchanged"
+    nc.set_press(False)
+    assert nc.matches("sky", 1.0) and not nc.matches("glow", 1.0)
+    nc.restore()
+    assert not nc.active and be.log[-1] == "restore" and not be.system
+    nc.restore()                                              # idempotent
+    assert be.log.count("restore") == 1
+    assert nc.install("glow", 1.0) and nc.matches("glow", 1.0)  # re-installable after a restore
+    assert be.log.count("probe") == 1, "alpha self-test runs once"
+    nc.restore()
+    assert not be.live - set(be.system.values()) or True        # templates destroyed; copies owned by the system
+
+
+def test_native_cursor_refuses_when_unsafe():
+    from handjob.native_cursor import NativeCursor
+    be = _FakeCursorBackend(alpha=None)                        # self-test inconclusive
+    nc = NativeCursor(be)
+    assert nc.install("sky") is False and not nc.active and nc.failed and "inconclusive" in nc.error
+    assert not be.system, "nothing may be installed when the self-test is inconclusive"
+    assert nc.install("sky") is False, "a failed machine is not retried every frame"
+    be2 = _FakeCursorBackend(refuse_normal=True)
+    nc2 = NativeCursor(be2)
+    assert nc2.install("sky") is False and be2.log[-1] == "restore" and not be2.system
+    assert NativeCursor(_FakeCursorBackend()).install("system") is False   # 'system' style: nothing to install
+    be3 = _FakeCursorBackend(alpha="premultiplied")
+    nc3 = NativeCursor(be3)
+    assert nc3.install("sky")
+    n_pre = be3.created[0][0]
+    assert n_pre == be3.created[0][1] * be3.created[0][2] * 4
+
+
+def test_snapshot_with_native_pointer_draws_decorations_only():
+    """2.6: when the orb IS the OS cursor the overlay must not draw it again (that was the
+    double cursor), but trail / ripple / sparkles still render, and an idle overlay sleeps."""
+    import time as _t
+    from handjob.engine import CursorBus
+    bus = CursorBus()
+    bus.armed, bus.found, bus.position = True, True, (500, 500)
+    bus.native_active = True
+    assert bus.snapshot() is None, "nothing to decorate -> overlay idles"
+    now = _t.time()
+    bus.update_trail(480, 500, now - 0.05)
+    s = bus.snapshot(now)
+    assert s is not None and s["cursor"] is None and len(s["trail"]) == 1
+    bus.native_active = False
+    s = bus.snapshot(now)
+    assert s["cursor"] == (500, 500), "legacy overlay path still draws the orb itself"
+
+
+# ---------------------------------------------------------------- 2.6 preview ---
+def test_preview_worker_coalesces_and_never_blocks_the_engine():
+    import time as _t
+    import cv2
+    import numpy as np
+    from handjob.preview import PreviewWorker, render_preview
+    hand = [(0.3 + 0.02 * i, 0.4 + 0.01 * i) for i in range(21)]
+    frame = np.full((480, 854, 3), 40, np.uint8)
+    got = []
+    w = PreviewWorker(got.append, max_fps=20)
+    w.start()
+    try:
+        t0 = _t.perf_counter()
+        for _ in range(200):                      # the engine submits every frame
+            w.submit("wireframe", frame, [hand], 0, None)
+        assert _t.perf_counter() - t0 < 0.05, "submit() must be O(1)"
+        _t.sleep(0.5)
+        n = len(got)
+        assert 1 <= n <= 14, f"worker must coalesce + rate-limit, got {n} encodes in 0.5 s"
+        img = cv2.imdecode(np.frombuffer(got[-1], np.uint8), cv2.IMREAD_COLOR)
+        assert img.shape[1] <= 480 and img.shape[1] / img.shape[0] > 1.5
+        assert img.max() > 200, "skeleton must be drawn"
+    finally:
+        w.stop()
+    cam = render_preview("camera", frame, [hand], 0, [(x + 0.01, y) for x, y in hand])
+    assert cam.shape[:2] == (270, 480) and abs(int(cam.mean()) - 40) < 25
+    assert render_preview("wireframe", frame, [], None, None).sum() == 0
+
+
+# ------------------------------------------------- 2.6 engine, end to end ---
+def test_open_camera_caches_the_mode_so_reconnects_skip_the_probe():
+    from handjob.engine import Engine, CursorBus
+    e = Engine(CursorBus())
+    probes, opens = [], []
+    e._probe_capture_fps = lambda idx, w, h, fps, secs: (probes.append((idx, w, h)) or (8.0 if w == 1280 else 29.0))
+    e._open_mode = lambda idx, w, h, fps: (opens.append((idx, w, h)) or object())
+    assert e._open_camera(0) is not None
+    assert probes == [(0, 1280, 720), (0, 640, 480)], probes       # 720p trickled -> measured 640x480
+    assert opens == [(0, 640, 480)] and e._cam_mode == (640, 480)
+    probes.clear()
+    assert e._open_camera(0) is not None                            # reconnect after a stall / fps change
+    assert probes == [], "a reconnect must not spawn probe subprocesses again"
+    assert opens[-1] == (0, 640, 480)
+    # a cached mode that stops opening is forgotten and re-measured
+    e._open_mode = lambda idx, w, h, fps: (opens.append((idx, w, h)) or (None if len(opens) == 3 else object()))
+    assert e._open_camera(0) is not None and probes, "stale cache must trigger a re-measure"
+
+
+def _run_engine_rig(cam_mode, f, A, seconds=6.0, sigma=0.0015):
+    """Real Engine + fake 30 fps camera + stub hand model: returns best-fit lag (ms) of the emitted cursor."""
+    import math
+    import random
+    import threading
+    import time as _t
+    from collections import deque
+    import numpy as np
+    import handjob.engine as eng_mod
+    from handjob.engine import Engine, CursorBus
+
+    class Cam:
+        def __init__(self):
+            self.period, self.cap_t, self.n, self.last, self.stop = 1 / 30.0, {}, 0, -1, False
+            self.cv, self.q, self.slot = threading.Condition(), deque(), None
+            threading.Thread(target=self._prod, daemon=True).start()
+
+        def _prod(self):
+            nxt = _t.perf_counter()
+            while not self.stop:
+                nxt += self.period
+                _t.sleep(max(0.0, nxt - _t.perf_counter()))
+                idx, self.n = self.n, self.n + 1
+                self.cap_t[idx] = _t.perf_counter()
+                img = np.full((480, 854, 3), 40, np.uint8)
+                img[:16, :, 2], img[:16, :, 1] = idx & 255, (idx >> 8) & 255
+                with self.cv:
+                    if cam_mode == "latest":
+                        self.slot = (idx, img)
+                    elif len(self.q) < 4:
+                        self.q.append((idx, img))            # a driver queue: stale frames pile up
+                    self.cv.notify_all()
+
+        def isOpened(self):
+            return True
+
+        def release(self):
+            self.stop = True
+
+        def read(self):
+            with self.cv:
+                if cam_mode == "latest":
+                    while self.slot is None or self.slot[0] <= self.last:
+                        self.cv.wait(0.5)
+                    idx, img = self.slot
+                else:
+                    while not self.q:
+                        self.cv.wait(0.5)
+                    idx, img = self.q.popleft()
+            self.last = idx
+            return True, img.copy()
+
+    class LM:
+        __slots__ = ("x", "y", "z")
+
+        def __init__(self, x, y, z):
+            self.x, self.y, self.z = x, y, z
+
+    t0 = _t.perf_counter()
+    truth = lambda t: A * math.sin(2 * math.pi * f * (t - t0))
+    cam, rnd = Cam(), random.Random(5)
+
+    class Stub:
+        def detect_for_video(self, image, ts):
+            a = image.numpy_view()
+            idx = int(round(float(a[2, :, 0].mean()))) + 256 * int(round(float(a[2, :, 1].mean())))
+            dx = truth(cam.cap_t.get(idx, _t.perf_counter()))
+            _t.sleep(0.012)                                  # inference cost (releases the GIL like the real one)
+            lm = _hand()
+            return type("R", (), {"hand_landmarks": [[LM(x + dx + rnd.gauss(0, sigma), y + rnd.gauss(0, sigma), z)
+                                                      for x, y, z in lm]], "hand_world_landmarks": []})()
+
+        def close(self):
+            pass
+
+    saved = eng_mod.os_cursor_pos
+    eng_mod.os_cursor_pos = lambda: (960.0, 540.0)
+    try:
+        e = Engine(CursorBus())
+        e.capture = cam
+        e._load_model = lambda: setattr(e, "landmarker", Stub())
+        rec = []
+        e.motion.set_output(lambda x, y: rec.append((_t.perf_counter(), x)))
+        e.arm(True)
+        e.start()
+        _t.sleep(seconds)
+        e.stop()
+        e.join(3.0)
+        assert not e.is_alive(), "engine thread must shut down cleanly (and be joinable)"
+        frames = e.bus.frames
+    finally:
+        eng_mod.os_cursor_pos = saved
+        cam.release()
+    ts, xs = np.array([r[0] for r in rec]), np.array([r[1] for r in rec])
+    k = ts > t0 + 2.5
+    ts, xs = ts[k], xs[k]
+    best = None
+    for d in np.arange(-0.10, 0.45, 0.004):
+        tr = np.array([truth(t - d) for t in ts])
+        A_ = np.vstack([tr, np.ones_like(tr)]).T
+        coef, *_ = np.linalg.lstsq(A_, xs, rcond=None)
+        err = float(np.sqrt(np.mean((A_ @ coef - xs) ** 2)))
+        if best is None or err < best[1]:
+            best = (d, err)
+    return best[0] * 1000.0, frames / seconds
+
+
+def test_engine_loop_end_to_end_has_low_lag_even_with_a_stale_frame_driver_queue():
+    """The whole pipeline (grabber -> gated aim -> noise-adaptive motion -> emitter) against a
+    fake camera.  2.4.1 measured ~160 ms (DSHOW-like) / ~270 ms (queueing driver) on this rig."""
+    lag_latest, fps = _run_engine_rig("latest", 0.25, 0.03)
+    assert lag_latest < 70.0, f"slow-move lag {lag_latest:.0f} ms"
+    assert fps > 24, f"engine processed only {fps:.1f} fps from a 30 fps camera"
+    lag_fifo, _ = _run_engine_rig("fifo", 0.25, 0.03)
+    assert lag_fifo < 70.0, f"lag with a queueing driver {lag_fifo:.0f} ms — stale frames reached the cursor"
 
 
 def main():

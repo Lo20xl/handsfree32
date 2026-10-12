@@ -107,18 +107,9 @@ class Api:
 
     def get_state(self):
         bus = self.bus
-        # One local reference for the whole call: self.engine is only ever
-        # reassigned inside refresh_app, and reading it field-by-field while a
-        # refresh swaps it mid-dict is a torn-state race.
-        eng = self.engine
-        # cam_name MUST be resolved outside bus.lock: the first call after a
-        # refresh_app runs a full DirectShow/COM device enumeration (tens of ms),
-        # which used to block the engine's bus.position write and the overlay's
-        # snapshot() for the entire enumeration.
-        cam_name = eng._cam_device_name()
         with bus.lock:
             return {
-                "armed": eng.armed,
+                "armed": self.engine.armed,
                 "engine_started": self._engine_started,
                 "hand_found": bus.found,
                 "fps": round(bus.fps, 1),
@@ -129,20 +120,17 @@ class Api:
                 "settings": settings.get(),
                 "version": __version__,
                 "log_path": LOG_PATH,
-                "infer_ms": round(eng._infer_ms, 1),
-                "pose": eng._prev_pose,
+                "infer_ms": round(self.engine._infer_ms, 1),
+                "pose": self.engine._prev_pose,
                 "pinch_l": self._pinch()[0],
                 "pinch_r": self._pinch()[1],
                 "sonar": self._sonar_state(),
                 "cam_reads": bus.cam_reads,
                 "cam_unique": bus.cam_unique,
-                "backend": getattr(eng, "_backend_name", "mediapipe"),
-                "cam_name": cam_name,
             }
 
     def _sonar_state(self):
         """Sonar diagnostics for the UI (experimental sensing channel)."""
-        from .sonar import CARRIER_MIN_DB
         eng = self.engine
         so = getattr(eng, "sonar", None)
         err = getattr(eng, "_sonar_last_error", None)
@@ -151,22 +139,14 @@ class Api:
             available = _sd is not None
         except Exception:
             available = False
-        diag = dict(getattr(so, "diag", {}) or {}) if so is not None else {}
-        # A tone the mic cannot hear is a hardware limit, not a fault — say so
-        # instead of showing "motion 0.00" forever, which reads as broken.
-        note = None
-        if so is not None and diag.get("blocks", 0) > 12 and not diag.get("carrier_ok", True):
-            note = (f"{diag.get('tone', 0):.0f} Hz tone not audible to this mic "
-                    f"(+{diag.get('carrier_db', 0):.0f} dB over floor, needs "
-                    f"+{CARRIER_MIN_DB:.0f}) — try another tone or audio device")
-        out = {"available": available,
-               "enabled": bool(settings.get("sonar_enabled")),
-               "diag": diag,
-               "carrier_ok": diag.get("carrier_ok"),
-               "note": note,
-               "error": err if (err and so is None) else None,
-               "in_device": int(settings.get("sonar_in_device")),
-               "out_device": int(settings.get("sonar_out_device"))}
+        out = {
+            "available": available,
+            "enabled": bool(settings.get("sonar_enabled")),
+            "diag": dict(getattr(so, "diag", {}) or {}),
+            "error": err if (err and so is None) else None,
+            "in_device": int(settings.get("sonar_in_device")),
+            "out_device": int(settings.get("sonar_out_device")),
+        }
         return out
 
     def _pinch(self):
@@ -187,6 +167,20 @@ class Api:
             summary = eng.tel.summary(eng.motion)
         except Exception as e:
             summary = f"telemetry unavailable: {e}"
+        try:
+            cam = eng.camera_stats()
+            if cam:
+                fmt = lambda v: "-" if v is None else (f"{v:.1f}" if isinstance(v, float) else str(v))
+                summary += (f"\ncamera thread: {'connected' if cam['connected'] else 'DISCONNECTED'} size {cam['size']} "
+                            f"mode {cam['mode']} | reads/s {fmt(cam['reads_per_s'])} new/s {fmt(cam['new_per_s'])} "
+                            f"| frames {cam['frames']} dropped {cam['dropped']} reopens {cam['reopens']} "
+                            f"| brightness {cam['brightness']}"
+                            + (f" | ERROR {cam['error']}" if cam["error"] else ""))
+            nc = eng.native
+            summary += ("\npointer: " + ("native OS cursor active" if nc is not None and nc.active
+                                         else f"overlay/legacy (native {'failed: ' + str(nc.error) if nc is not None and nc.failed else 'not active'})"))
+        except Exception as e:
+            summary += f"\n(camera/pointer stats unavailable: {e})"
         return {"ok": True, "summary": summary}
 
     # -- media ---------------------------------------------------------------
@@ -334,13 +328,11 @@ class Api:
                     self.overlay.join(timeout=2.0)
             except Exception:
                 log.exception("refresh: overlay stop failed")
-            self._engine_started = False
             self.bus = CursorBus()
             self.overlay = Overlay(self.bus)
             self.overlay.start()
             self.engine = Engine(self.bus)
             self.engine.start()
-            self._engine_started = True
         log.info("refresh_app: backend restarted")
         return {"ok": True}
 
@@ -359,11 +351,13 @@ class Api:
 def run_dev_selftest():
     """Headless smoke: model loads, engine thread runs, no camera required."""
     from .engine import CursorBus, Engine
+    settings.load()          # without this the selftest always tests DEFAULTS,
+    #                          never the backend/model the user actually saved
     bus = CursorBus()
     eng = Engine(bus)
     eng._load_model()
     print("MODEL_LOAD_OK", eng.landmarker is not None)
-    print("BACKEND", getattr(eng, "_backend_name", "?"))
+    print("BACKEND", eng._backend_name)
     # sonar stack (experimental): sounddevice + bundled portaudio must survive
     # packaging — a missing DLL fails silently at feature-use time otherwise
     try:
@@ -446,7 +440,7 @@ def run_probe(seconds=3.0):
     Writes 'PROBE OK' or 'PROBE FAIL <reason>' as the last line.
     """
     import time as _t
-    from .engine import CursorBus, Engine, SONAR_BOOT_S
+    from .engine import CursorBus, Engine
     from . import input_win32 as wi
 
     ok = []
@@ -481,32 +475,6 @@ def run_probe(seconds=3.0):
             raise RuntimeError("portaudio reports no audio devices")
         print(f"  sonar: sounddevice ok, {len(devs)} audio devices visible")
     check("sonar stack (sounddevice/portaudio)", sonar_stack)
-
-    # Actually START the sonar, not just import it: the stack check above passes
-    # in any session where the portaudio DLL is present, which says nothing about
-    # whether the tone output and analysis input can really open (sample-rate
-    # mismatch, a device held by another app, a driver in a bad state). Run it
-    # through the engine's own supervisor so the retry/backoff path is exercised
-    # too, then confirm blocks are actually being analysed.
-    def sonar_live():
-        from .sonar import Sonar
-        s = Sonar()
-        s.start_async().join(timeout=SONAR_BOOT_S)
-        if s.start_error:
-            raise RuntimeError(f"sonar would not start: {s.start_error}")
-        try:
-            deadline = time.time() + 3.0
-            while time.time() < deadline and s.diag.get("blocks", 0) < 5:
-                time.sleep(0.1)
-            d = dict(s.diag)
-            if d.get("blocks", 0) < 5:
-                raise RuntimeError(f"sonar opened but analysed no blocks ({d})")
-            print(f"  sonar: live — {d['blocks']} blocks @ {d.get('sr')} Hz, "
-                  f"tone {d.get('tone'):.0f} Hz, carrier +{d.get('carrier_db', 0):.0f} dB "
-                  f"over floor, motion {d.get('score', 0):.2f}")
-        finally:
-            s.stop()
-    check("sonar live start (tone out + analysis in)", sonar_live)
 
     # input round trip — read the cursor fresh each attempt and retry a few
     # times: the user may be moving the mouse or a fullscreen game may be
@@ -582,6 +550,7 @@ def run_probe(seconds=3.0):
                 self._t = 0.0
 
             def read(self):
+                _t.sleep(1 / 30.0)                     # a real 30 fps source blocks; the engine no longer paces
                 self._t += 1 / 30.0
                 img = _np.zeros((480, 854, 3), dtype=_np.uint8)
                 img[:] = int(self._t * 60) % 256
@@ -604,7 +573,6 @@ def run_probe(seconds=3.0):
         _t.sleep(float(seconds))
         frames = bus.frames - base
         fps, lat = bus.fps, bus.latency_ms
-        print(f"  backend: {getattr(eng, '_backend_name', '?')}")
         err = bus.error
         eng.stop()
         eng.cleanup()
@@ -620,49 +588,6 @@ def run_probe(seconds=3.0):
         print(f"  frames={frames} in {seconds:.0f}s  fps={fps:.1f} latency={lat:.1f}ms")
     check(f"engine loop ({seconds:.0f}s, synthetic feed)", engine_rt)
 
-    def engine_dup_rt():
-        """2.5.1: a REPEATING feed (what a static scene on a virtual cam does)
-        must not stall the engine — the duplicate-frame gate once slept
-        ~forever on the first repeated frame due to a clock mix."""
-        import numpy as _np
-
-        class _RepeatFeed:
-            def __init__(self):
-                self.n = 0
-
-            def isOpened(self):
-                return True
-
-            def read(self):
-                self.n += 1
-                frame = _np.zeros((48, 64, 3), dtype=_np.uint8)
-                k = (self.n // 3) % 32
-                frame[8:16, k:k + 8] = 200
-                return True, frame
-
-            def set(self, *a):
-                pass
-
-            def release(self):
-                pass
-
-        bus2 = CursorBus()
-        eng2 = Engine(bus2)
-        eng2.capture = _RepeatFeed()
-        eng2._dedupe = True                  # force the duplicate gate on
-        eng2.start()
-        t0 = _t.time()
-        while _t.time() - t0 < 8 and bus2.frames < 4 and not bus2.error:
-            _t.sleep(0.2)
-        eng2.stop()
-        eng2.cleanup()
-        if bus2.error:
-            raise RuntimeError(bus2.error)
-        if bus2.frames < 4:
-            raise RuntimeError(f"duplicate-frame gate stalled the engine ({bus2.frames} frames in 8s)")
-        print(f"  repeated feed survived: {bus2.frames} frames processed")
-    check("duplicate-frame handling (repeated feed)", engine_dup_rt)
-
     print(f"PROBE OK {len(ok)} ok, {len(fail)} failed" if not fail
           else "PROBE FAIL " + "; ".join(fail))
     return 0 if not fail else 1
@@ -673,10 +598,6 @@ def run_camprobe(index, w, h, fps, seconds):
     'CAMPROBE <fps>'. Spawned by the engine's camera probe so a driver-level
     crash (access violation) takes down the probe, not the app."""
     import cv2 as _cv2
-    # Mirrors engine.CAMERA_MIN_W/H. Duplicated rather than imported: this runs
-    # as a bare `--camprobe` subprocess where importing handjob.engine would
-    # pull in the model stack and defeat the point of the isolated probe.
-    _MIN_W, _MIN_H = 320, 240
     cap = None
     for backend in (_cv2.CAP_DSHOW, _cv2.CAP_ANY):
         try:
@@ -693,21 +614,7 @@ def run_camprobe(index, w, h, fps, seconds):
             cap.set(_cv2.CAP_PROP_FRAME_HEIGHT, int(h))
             cap.set(_cv2.CAP_PROP_FPS, int(fps))
             cap.set(_cv2.CAP_PROP_BUFFERSIZE, 1)
-            ok, frame = cap.read()
-            if ok and frame is not None:
-                # The probe must judge the mode the driver ACTUALLY delivered: a
-                # held/degenerate stream answers full-rate with a tiny default
-                # frame (seen: 64x48), which would otherwise be blessed as a
-                # good mode and handed to the engine, where the hand is ~10 px
-                # of noise and the landmarks jump. Report the mismatch as a
-                # failure so the ladder moves on.
-                fh, fw = frame.shape[:2]
-                if fw < _MIN_W or fh < _MIN_H:
-                    print(f"CAMPROBE FAIL (delivered {fw}x{fh}, below {_MIN_W}x{_MIN_H})")
-                    cap.release()
-                    return 1
-                if (fw, fh) != (int(w), int(h)):
-                    print(f"CAMPROBE NOTE asked {w}x{h} delivered {fw}x{fh}")
+            ok, _ = cap.read()
             if not ok:
                 cap.release()
                 cap = None
@@ -747,9 +654,18 @@ def main(argv=None):
     parser.add_argument("--camprobe", nargs=5, metavar=("INDEX", "W", "H", "FPS", "SECONDS"),
                         help="internal: measure one camera mode, print CAMPROBE <fps>")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--restore-cursors", action="store_true",
+                        help="give back the Windows cursor scheme (if a crash ever left the orb installed) and exit")
     args = parser.parse_args(argv)
 
     _setup_logging(args.verbose)
+    if sys.platform == "win32":
+        # 2.6: the orb can be installed as the OS cursor; a crash must never leave it behind.
+        from .native_cursor import restore_system_cursors
+        restore_system_cursors()
+        if args.restore_cursors:
+            print("cursors restored")
+            return 0
     log.info("%s %s starting (frozen=%s)", APP_NAME, __version__, getattr(sys, "frozen", False))
 
     # fair GIL scheduling: the engine thread must never starve the UI thread

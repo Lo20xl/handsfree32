@@ -22,6 +22,14 @@ This module cleans the stream itself, per hand, before anything else reads it:
 
 All budgets are expressed in PALM LENGTH units, so the same parameters work
 for image-space (normalized) and world-space (metres) landmarks.
+
+2.6: two outputs.  `process()` returns the SMOOTHED landmarks (pose / pinch).
+`self.gated` holds the same frame after the spike gate only — NO smoothing.
+The cursor aim point reads `gated`: the cursor's own noise-adaptive stage
+(motion.py) is the single place where the aim is smoothed.  Filtering the aim
+here as well (the old 0.5 Hz / beta 2 chain) stacked two low-pass stages and
+cost ~100 ms of lag on slow, precise movements.  The retuned BETA also halves
+the lag of the pinch metric during the (fast) finger-closing motion.
 """
 
 from __future__ import annotations
@@ -33,15 +41,14 @@ WRIST, MIDDLE_MCP = 0, 9
 
 # 1€ filter defaults (tuned for 30-60 fps landmark streams; measured on
 # synthetic jitter+swipe: rest jitter ~13% of raw variance, swipe lag ~0.1 palm)
-MIN_CUTOFF = 0.5    # Hz at rest — the strength of the jitter kill
-BETA = 2.0          # cutoff gain per (palm-lengths/s) of speed — motion passes
+MIN_CUTOFF = 0.8    # Hz at rest — the strength of the jitter kill
+BETA = 10.0         # cutoff gain per (palm-lengths/s) of speed — motion passes (2.6: was 2.0 = mushy)
 D_CUTOFF = 2.5      # Hz — velocity-estimate filter (slow enough to not chase jitter)
 SPIKE_FRAC = 0.25   # max single-frame jump in palm-lengths at rest (dt-scaled)
 SPIKE_SPEED = 2.5   # extra budget = 2.5x current speed per frame — sustained
                     # motion self-authorizes; a teleport from rest stays tight
-PALM_GLITCH = 0.60  # palm length change vs the last ACCEPTED frame above this =
-                    # tracker glitch (held one frame). See the ponytail note in
-                    # process(): 40% fought real rotation; a depth inversion is 2-4x.
+PALM_GLITCH = 0.40  # palm length change per frame above this = tracker glitch
+SPEED_DEAD = 0.45   # palm-lengths/s of 'speed' that is just sensor noise: no cutoff boost below it
 
 
 def _alpha(dt: float, cutoff_hz: float) -> float:
@@ -71,9 +78,10 @@ class LandmarkStabilizer:
         self._v = None      # filtered velocities (units/s) [21][3]
         self._t = None
         self._rejects = 0   # diagnostics: frames rejected by the palm guard
-        self._held_last = False  # the previous frame was palm-guarded (hold once)
-        self._palm_ref = 0.0  # palm length of the last ACCEPTED frame
         self._pending = None  # (palm, time) of the last scale-rejected frame
+        self.gated = None     # last frame after the spike gate only (unsmoothed) — the cursor aim reads this
+        self._g = None        # aim gate state: previous gated positions [21][3]
+        self._gs = None       # aim gate state: gated speed per landmark (units/s)
 
     # ------------------------------------------------------------------ util
     @staticmethod
@@ -90,43 +98,44 @@ class LandmarkStabilizer:
             return lms
         if self._x is None or self._t is None or now <= self._t or now - self._t > 0.5:
             self._seed(lms, now)              # first frame / long gap / clock skew
+            self.gated = [tuple(p) for p in lms]
             return list(lms)
         dt = min(0.25, now - self._t)
         self._t = now
-        # palm-scale guard: a big palm-length jump is a tracker glitch, not a hand.
-        # The reference is the palm of the last ACCEPTED frame (not the filtered
-        # landmarks, which lag and re-trigger the guard on the frame after every
-        # hold). A glitch is held for ONE frame; anything that persists is real
-        # motion — the hand rotated, leaned in, or the tracker re-locked at a new
-        # depth — and must be followed, because holding it froze the cursor solid
-        # while the hand kept moving.
-        #
-        # ponytail: PALM_GLITCH=0.60 is a deliberate ceiling. 40% was fighting
-        # real rotation (a fast flick changes the projected wrist->MCP length by
-        # ~cos of the yaw delta, so 50%+/frame is physically reachable) and
-        # dropping half the frames. Raise it if a real z-flip ever slips through;
-        # a genuine depth inversion changes length by 2-4x, well past this.
+        # palm-scale guard: a big palm-length jump is a tracker z-flip, not a hand
         palm_now = self._palm(lms)
+        palm_prev = self._palm(self._x)
         if palm_now < 0.02 or palm_now > 0.9:
             self._rejects += 1
             return [tuple(p) for p in self._x]
-        if not self._held_last and abs(palm_now - self._palm_ref) > PALM_GLITCH * self._palm_ref:
-            self._held_last = True
+        if abs(palm_now - palm_prev) > PALM_GLITCH * palm_prev:
+            # z-flip (one frame) vs a real change of apparent size. A glitch is
+            # gone next frame; a persistent change (hand leaned in/out, turned
+            # toward the camera) survives — re-seed onto it instead of holding
+            # the old frame forever (which froze the cursor permanently).
+            pend = self._pending
+            if pend is not None and abs(palm_now - pend[0]) <= PALM_GLITCH * pend[0]:
+                self._pending = None
+                self._seed(lms, now)
+                self.gated = [tuple(p) for p in lms]
+                return list(lms)
+            self._pending = (palm_now, now)
             self._rejects += 1
             return [tuple(p) for p in self._x]
-        self._held_last = False
-        self._palm_ref = palm_now
+        self._pending = None
         a_d = _alpha(dt, self.d_cutoff)
         out = []
+        gated = []
         for i in range(N_LMS):
             p = lms[i]
             fx, fy, fz = self._x[i]
             vx, vy, vz = self._v[i]
             x, y, z = float(p[0]), float(p[1]), float(p[2])
+            rx, ry, rz = x, y, z              # raw, for the aim gate
             # speed from PREVIOUS frames only — a teleport must not authorize
             # its own budget within the same frame
             speed = math.hypot(vx, vy)
-            budget = (self.spike_frac + SPIKE_SPEED * (speed / palm_now) * dt) * palm_now
+            budget = (self.spike_frac + SPIKE_SPEED * (speed / palm_prev) * dt) * palm_prev
             jx, jy = x - fx, y - fy
             jump = math.hypot(jx, jy)
             if jump > budget > 0:
@@ -134,13 +143,28 @@ class LandmarkStabilizer:
                 x = fx + jx * pull
                 y = fy + jy * pull
                 z = fz + (z - fz) * pull
+            # --- aim gate: spike protection relative to the PREVIOUS GATED point, not to the
+            # (lagging, heavily smoothed) filter state, so the cursor path stays unsmoothed
+            gpx, gpy, gpz = self._g[i]
+            gs = self._gs[i]
+            bud_g = (self.spike_frac + SPIKE_SPEED * (gs / palm_prev) * dt) * palm_prev
+            jgx, jgy = rx - gpx, ry - gpy
+            jg = math.hypot(jgx, jgy)
+            if jg > bud_g > 0:
+                pg = bud_g / jg
+                gnx, gny, gnz = gpx + jgx * pg, gpy + jgy * pg, gpz + (rz - gpz) * pg
+            else:
+                gnx, gny, gnz = rx, ry, rz
+            self._gs[i] = 0.5 * gs + 0.5 * math.hypot(gnx - gpx, gny - gpy) / dt
+            self._g[i] = (gnx, gny, gnz)
+            gated.append((gnx, gny, gnz))
             # velocity filter tracks the GATED delta: sustained real motion
             # opens the budget over a few frames; a one-off teleport never does
             vx += a_d * ((x - fx) / dt - vx)
             vy += a_d * ((y - fy) / dt - vy)
             vz += a_d * ((z - fz) / dt - vz)
             # adaptive EMA: cutoff rises with speed -> no lag while moving
-            cutoff = self.min_cutoff + self.beta * (speed / palm_now)
+            cutoff = self.min_cutoff + self.beta * max(0.0, speed / palm_prev - SPEED_DEAD)
             a = _alpha(dt, cutoff)
             fx += a * (x - fx)
             fy += a * (y - fy)
@@ -148,13 +172,14 @@ class LandmarkStabilizer:
             self._x[i] = [fx, fy, fz]
             self._v[i] = [vx, vy, vz]
             out.append((fx, fy, fz))
+        self.gated = gated
         return out
 
     def _seed(self, lms, now: float) -> None:
         self._x = [[float(p[0]), float(p[1]), float(p[2])] for p in lms]
         self._v = [[0.0, 0.0, 0.0] for _ in range(N_LMS)]
-        self._held_last = False
-        self._palm_ref = self._palm(lms)
+        self._g = [(float(p[0]), float(p[1]), float(p[2])) for p in lms]
+        self._gs = [0.0] * N_LMS
         self._t = now
 
 
@@ -196,8 +221,10 @@ def _selftest() -> None:
     tele[8] = (0.9, 0.9, 0.0)                     # fingertip teleports
     out = st.process(tele, t + 1 / 30.0)
     assert out[8][0] < 0.7, out[8]                # far from the teleport target
+    assert st.gated[8][0] < 0.7, st.gated[8]      # the unsmoothed aim path is gated too
     out2 = st.process(hand(0.5, 0.5), t + 2 / 30.0)
     assert abs(out2[8][0] - 0.5) < 0.25, out2[8]  # recovers
+    assert abs(st.gated[8][0] - hand(0.5, 0.5)[8][0]) < 0.03, st.gated[8]   # back on the real tip
     # 3) fast swipe is followed
     st = LandmarkStabilizer()
     t, x = 0.0, 0.3
@@ -211,6 +238,8 @@ def _selftest() -> None:
         out = st.process(hand(x, 0.5), t)
     lag = (x + tip_off) - out[8][0]
     assert lag < 0.2, (out[8][0], x, lag)     # under ~0.2 palm lag on a hard flick
+    glag = (x + tip_off) - st.gated[8][0]
+    assert glag < 0.1, (st.gated[8][0], x, glag)      # the aim path follows even closer
     # 4) palm-scale glitch frame is rejected
     st = LandmarkStabilizer()
     t = 0.0

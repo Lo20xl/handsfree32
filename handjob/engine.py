@@ -12,6 +12,19 @@ frame — the difference between a 30 Hz and a 60 Hz loop.
 2.1: edge hold (EdgeStabilizer) keeps the cursor still while the aim point is
 inside the frame margin, where MediaPipe landmarks go noisy; experimental
 sonar sensing (`sonar.py`) is supervised here but never drives the cursor.
+
+2.6 "smooth core":
+  * the camera is read by its own thread (camera.FrameGrabber): the engine always
+    gets the NEWEST frame with a perf_counter arrival stamp — no stale-frame
+    backlog, no time.time() 15.6 ms clock steps in every dt and velocity;
+  * the aim point is the spike-gated, UNSMOOTHED fingertip; the cursor's own
+    noise-adaptive stage (motion.py) is the only place it is smoothed (the old
+    chain smoothed it twice: ~100 ms of lag on slow, precise moves);
+  * the preview is encoded by its own worker (preview.py), not between frames;
+  * the orb/ring is installed as the real OS cursor (native_cursor.py) so it can
+    never lag or jitter against the pointer; the overlay only draws decorations;
+  * the camera is never re-opened to "re-measure": reconnects reuse the mode the
+    first open settled on, and low unique-fps only warns.
 """
 import base64
 import logging
@@ -22,10 +35,11 @@ import shutil
 import sys
 import threading
 import time
-from collections import deque
 
 import cv2
-import numpy as np
+from mediapipe import Image as MpImage, ImageFormat
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
 
 from . import gestures as G
 from . import input_win32 as wi
@@ -35,6 +49,9 @@ from .motion import CursorMotion
 from .click_refiner import ClickRefiner
 from .hand3d import PinchMeter3D, PoseTracker, EdgeStabilizer, reanchor, os_cursor_pos, Telemetry
 from .lmsmooth import LandmarkStabilizer
+from .camera import FrameGrabber
+from .preview import PreviewWorker
+from .native_cursor import NativeCursor, Win32CursorBackend, system_dpi_scale
 
 MODEL_NAME = "hand_landmarker.task"
 CUSTOM_MODELS_DIR = "models"          # imported .task files live here, beside the app
@@ -42,197 +59,23 @@ PREVIEW_JPEG_QUALITY = {"jpg": [int(cv2.IMWRITE_JPEG_QUALITY), 55]}
 SKY_BGR = (248, 189, 56)
 WHITE_BGR = (255, 255, 255)
 
-ENGINE_FPS_FALLBACK = 30     # pacing target when capture_fps is unknown
-PREVIEW_MIN_INTERVAL = 0.034  # ~30 fps preview encode — the UI mirrors tracking 1:1
-CAMERA_STALL_S = 4.0         # NO frames at all for this long -> the read is stuck
-CAMERA_STALL_REOPENS = 3     # consecutive stall reopens before giving up (per ~minute)
-CAMERA_OPEN_DEADLINE_S = 12.0  # a wedged driver can hang VideoCapture() itself
+ENGINE_FPS_FALLBACK = 30     # camera rate requested when capture_fps is unknown
+PREVIEW_FPS = 15.0           # UI preview rate (encoded off-thread)
 CAMERA_MIN_FPS = 12.0        # delivered fps below this = driver trickle mode
-CAMERA_MIN_W, CAMERA_MIN_H = 320, 240  # below this a hand is unresolvable: reject the mode
-SONAR_RETRY_S = 10.0         # sonar start failures back off this long before retrying
-                            # (a mic briefly held by another app must not disable
-                            # the sonar for the whole session)
-SONAR_BOOT_S = 2.0           # bounded wait for the sonar's PortAudio open
-FROZEN_UNIQUE_FPS = 2.0      # at/below this the source is frozen, not merely slow
-FROZEN_ERR = ("camera frozen — same frame repeating, ~0 new frames/s. Virtual cameras "
-              "(NVIDIA Broadcast, Camo, OBS) do this when their source app is closed, "
-              "PAUSED, or a phone is disconnected: pick a live camera in the Camera "
-              "dropdown or fix the source (unpause / reconnect), then click Refresh app")
-SIG_EPS = 0.35                # 16x16 mean-abs diff at/below this = the same frame.
-                              # ponytail: this is a ceiling, not a truth. Very
-                              # slow hand motion (a fingertip creeping <1 px/frame
-                              # in a dim room) can land under it and be gated as a
-                              # repeat — the unique-frame watchdog then reports a
-                              # low "new frames/s" and blames the camera. The 2.4.4
-                              # evidence tool (build/tune_repeats.py) sits at the
-                              # other end: too LOW and vcam repeats leak through
-                              # and inflate every dt. If tracking feels "held back"
-                              # on a slow feed, lower this before touching anything
-                              # downstream.
-
-# device names that identify a VIRTUAL camera chain (their frame source is a
-# separate app/phone we cannot see; "reads/s" then says nothing about liveness)
-_VIRTUAL_CAM_HINTS = ("camo", "broadcast", "obs", "virtual", "snap", "manycam",
-                      "droidcam", "iriun", "epoccam", "ndi")
-
-
-def _is_virtual_cam_name(name: str) -> bool:
-    n = (name or "").lower()
-    return any(h in n for h in _VIRTUAL_CAM_HINTS)
-
-
-def _is_dup_sig(sig, prev) -> bool:
-    """True when `sig` is (within sensor noise) the same frame as `prev`.
-
-    Virtual cams answer every read by repeating the last frame until the source
-    produces a new one; feeding those repeats downstream inflates every dt and
-    velocity estimate, so they must be dropped before the pipeline."""
-    return prev is not None and float(np.abs(sig - prev).mean()) <= SIG_EPS
-
-
-def _smooth_box(prev, box, kps, follow_ratio=0.25):
-    """Temporally smooth a palm detection (2.5.6).
-
-    The ONNX backend re-runs palm detection every frame; its box wanders by a
-    few pixels frame to frame, and since the landmark crop follows the box,
-    that noise becomes whole-hand common-mode jitter on the cursor. (The
-    reference MediaPipe pipeline reuses tracking rects between frames, so it
-    never inherits detector jitter.) An EMA with a jump gate: steady boxes are
-    smoothed (alpha .4); a jump bigger than `follow_ratio` of the box side
-    (lost hand, new hand, fast motion) is followed almost immediately."""
-    if prev is None:
-        return box, kps
-    pbox, pkps = prev
-    b = np.asarray(box, np.float32)
-    pb = np.asarray(pbox, np.float32)
-    k = np.asarray(kps, np.float32)
-    pk = np.asarray(pkps, np.float32)
-    jump = float(np.abs(b[:2] - pb[:2]).sum()) + float(abs(b[2] - pb[2]))
-    a = 0.85 if jump > follow_ratio * max(float(b[2]), 1.0) else 0.4
-    return tuple((pb + a * (b - pb)).tolist()), pk + a * (k - pk)
-
-
-def _stall_decision(stalls, max_reopens):
-    """After `stalls` consecutive no-frame reopen attempts: what next?
-
-    'reopen' while attempts remain, then 'give_up' — same policy style as the
-    frozen-camera watchdog. Chronic flappers get a clear error instead of an
-    endless reopen loop."""
-    return "give_up" if stalls > max_reopens else "reopen"
-
-
-class _CamReader(threading.Thread):
-    """Reads frames from a VideoCapture on its OWN thread so a driver-level
-    blocking read() can never wedge the engine loop.
-
-    A virtual-camera driver in a bad state can accept a capture and then never
-    return from read() — observed live with the NVIDIA Broadcast chain: the
-    engine thread sat in read() forever while the UI stayed up, so the user saw
-    a frozen preview and no tracking. The engine instead WAITS here with a
-    timeout and can abandon this reader (a read stuck in the driver cannot be
-    interrupted; the daemon thread leaks until the driver returns, if ever) and
-    open a fresh capture.
-
-    The newest frame wins (single slot): a slow consumer never builds a backlog.
-    """
-
-    def __init__(self, cap, max_hz=90.0):
-        super().__init__(daemon=True, name="HJ3-CamReader")
-        self.cap = cap
-        self._min_dt = 1.0 / max(1.0, float(max_hz))
-        self._cv = threading.Condition()
-        self._slot = None            # (t_read, frame) — newest
-        self._seq = 0
-        self._fail_since = None      # wall time since the driver started failing reads
-        # NOT "_stop": threading.Thread uses self._stop() internally in join()
-        # once the thread has finished — an attribute with that name makes any
-        # later join() die with "'Event' object is not callable".
-        self._abort = threading.Event()
-
-    def run(self):
-        cap = self.cap
-        while not self._abort.is_set():
-            t0 = time.time()
-            try:
-                ok, frame = cap.read()
-            except Exception:
-                ok, frame = False, None
-            if self._abort.is_set():
-                break
-            with self._cv:
-                if ok:
-                    self._fail_since = None
-                    self._slot = (time.time(), frame)
-                    self._seq += 1
-                elif self._fail_since is None:
-                    self._fail_since = time.time()
-                self._cv.notify_all()
-            dt = time.time() - t0
-            wait = self._min_dt - dt
-            if wait > 0:
-                time.sleep(wait)      # a vcam answering instantly must not spin a core
-        # best-effort release; this thread may itself be stuck in read() — fine,
-        # it is a daemon and the app never waits on it past `_stop_reader`'s join
-        try:
-            cap.release()
-        except Exception:
-            pass
-
-    def get(self, last_seq, timeout):
-        """Wait for a frame newer than `last_seq`.
-
-        Returns (seq, t_read, frame), or None when nothing arrived in `timeout`
-        (frame=None means the driver reported a failed read)."""
-        with self._cv:
-            self._cv.wait_for(
-                lambda: self._seq != last_seq or self._fail_since is not None or self._abort.is_set(),
-                timeout=timeout)
-            if self._seq != last_seq:
-                return self._seq, self._slot[0], self._slot[1]
-            if self._fail_since is not None:
-                return self._seq, None, None
-            return None
-
-    def abandon(self):
-        self._abort.set()
-        with self._cv:
-            self._cv.notify_all()
-
-
-def _frozen_cam_state(urate, streak):
-    """(streak, action) for the frozen-camera watchdog. action: 'error' | 'clear' | 'ok'.
-
-    A live camera always produces new frames — sensor noise alone changes every
-    read — so <=FROZEN_UNIQUE_FPS unique frames/s means the source is frozen, not
-    dim or slow. Two consecutive checks (~14 s) before erroring: one bad window
-    can be a hiccup."""
-    if urate is None:
-        return streak, "ok"
-    if urate < FROZEN_UNIQUE_FPS:
-        streak += 1
-        return streak, ("error" if streak >= 2 else "ok")
-    return 0, ("clear" if streak else "ok")
 CAMERA_PROBE_S = 0.6         # seconds of frames read to measure a fresh capture
 PRED_MIN_LEAD_S = 1.3        # prediction floor = 1.3 camera intervals
-PRED_LEAD_CAP_MS = 100.0     # ...capped: beyond this the lead overshoots on direction changes
 
 
 def _effective_prediction(slider_ms, dt) -> float:
     """Prediction to run with: the slider value, but never less than ~1.3
     camera intervals — at 30+ fps this is below the default 45 ms (slider
-    wins, unchanged), at ~10 fps feeds it scales so the emitter can
-    interpolate across the whole gap instead of jumping per sample.
-
-    The dt-scaled floor is CAPPED (2.5.6): at very low unique rates (a dark
-    room, a slow virtual cam) 1.3 intervals ballooned to 300+ ms and the
-    cursor overshot and swung on every direction change — jitter, felt as
-    "it got worse". Past the cap, longer gaps are handled by the
-    stop-detection/retract path, not by ever-longer lead."""
+    wins, unchanged), at ~10 fps feeds it scales to ~130 ms so the emitter
+    can interpolate across the whole gap instead of jumping per sample."""
     try:
         v = float(slider_ms or 0.0)
     except (TypeError, ValueError):
         v = 45.0
-    return max(v, min(PRED_MIN_LEAD_S * float(dt) * 1000.0, PRED_LEAD_CAP_MS))
+    return max(v, PRED_MIN_LEAD_S * float(dt) * 1000.0)
 
 
 # ---------------------------------------------------------------- models ----
@@ -250,11 +93,6 @@ def _task_path(name) -> str:
 
 
 def _landmarker_options(path, hands):
-    # imported lazily: mediapipe pulls matplotlib (~2 s of startup) and is only
-    # needed when the MediaPipe backend actually loads — the ONNX/GPU backend
-    # never touches it.
-    from mediapipe.tasks import python as mp_python
-    from mediapipe.tasks.python import vision
     return vision.HandLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=path),
         running_mode=vision.RunningMode.VIDEO,
@@ -282,7 +120,6 @@ def list_models():
 
 def validate_model(path) -> bool:
     """Load the file as a hand landmarker to prove it works; raises on failure."""
-    from mediapipe.tasks.python import vision
     lm = vision.HandLandmarker.create_from_options(_landmarker_options(path, 1))
     lm.close()
     return True
@@ -331,6 +168,7 @@ class _FakeCapture:
         return True
 
     def read(self):
+        time.sleep(1 / 30.0)            # act like a 30 fps camera (the engine no longer paces)
         return True, self._img.copy()
 
     def release(self):
@@ -359,6 +197,7 @@ class CursorBus:
         self.warning = None             # soft warning (e.g. black camera frames)
         self.cam_reads = None           # camera delivered reads/s (unique-frame watchdog)
         self.cam_unique = None          # camera NEW frames/s — what the cursor actually gets
+        self.native_active = False      # orb/ring is the real OS cursor: overlay draws decorations only
         self.virtual_screen = wi.virtual_screen()
         self.visual_event = threading.Event()   # set whenever the overlay has something new to draw
         self._preview = None
@@ -380,8 +219,10 @@ class CursorBus:
                 return None
             trail = ([(x, y, now - t) for (x, y, t) in self.trail if now - t < 0.5]
                      if show_cursor else [])
+            if self.native_active and not trail and not self.pulse and not self.particles:
+                return None                 # the OS draws the pointer: nothing for the overlay to do
             return dict(
-                cursor=(self.position if show_cursor else None),
+                cursor=(self.position if (show_cursor and not self.native_active) else None),
                 style=self.style, dim=self.dim,
                 armed=self.armed, press=self.press, pulse=self.pulse,
                 particles=list(self.particles), trail=trail,
@@ -438,13 +279,13 @@ class Engine(threading.Thread):
     def __init__(self, bus):
         super().__init__(daemon=True, name="HJ3-Engine")
         self.bus = bus
-        self._stop = threading.Event()
+        self._halt_evt = threading.Event()   # NOT `_stop`: that shadows threading.Thread._stop() and breaks join()
         self._control = threading.Event()   # armed state
         self._control_dirty = threading.Event()
         self.capture = None
         self.landmarker = None
         self._left_down = False
-        self._cursor_hidden = False
+        self._cursor_hidden = False     # legacy ShowCursor path (fallback only)
         self._scroll_since = 0.0
         self._last_dt = 1 / 30
         self._prev_frame_t = 0.0
@@ -457,7 +298,6 @@ class Engine(threading.Thread):
         self._estop_latch = False
         self._cfg_seen = None
         self._smoothing_seen = None
-        self._hold_seen = None
         self._hands_seen = int(settings.get("max_hands") or 1)
         self._target_fps = 60 if int(settings.get("capture_fps") or 0) >= 60 else ENGINE_FPS_FALLBACK
         self._last_wall = time.time()
@@ -466,44 +306,31 @@ class Engine(threading.Thread):
         self._trail_on = False          # set by _process_hand; the emitter feeds the trail
         self._driver_dialog = False     # UI asked for the camera driver property page
         self._slow_cam_streak = 0
-        self._frozen_streak = 0
         self._edge_last = None          # last stable aim point (x, y) before an edge hold
         self._cam_mode = None           # (w, h) the ladder actually landed on
-        self._rate_check_t = 0.0        # delivered-fps watchdog state
-        self._rate_check_frames = 0
-        self._rate_low_streak = 0
-        self._rate_reopen_t = 0.0
+        self._cam_mode_cache = {}       # (index, fps) -> (w, h): reconnects skip the probe ladder
+        self.grabber = None             # camera.FrameGrabber (own thread), created in _run
+        self._cam_status_t = 0.0
+        self._cam_err_set = False
+        self._dark_since = 0.0
+        self._last_ts_ms = 0            # MediaPipe needs strictly increasing timestamps
+        self.preview = PreviewWorker(bus.set_preview, max_fps=PREVIEW_FPS)
+        self.native = None              # NativeCursor, created lazily on first use
+        self._native_scale = 1.0
         self._pred_seen = None
         self._model_seen = str(settings.get("model_file") or "")   # live model switching
-        self._backend_seen = str(settings.get("backend") or "auto")  # live backend switching
-        self._backend_name = "mediapipe"                             # what _load_model picked
-        self._mp_image_cls = None       # set when the mediapipe backend loads (lazy import)
-        self._last_frame_dark = False   # last read frame was (near) black
-        self._cam_names = None          # index -> device name (lazy, per run)
-        self._uniq_check_t = 0.0        # unique-frame watchdog state
-        self._uniq_reopen_t = 0.0
-        self._uniq_bad_streak = 0
-        self._sig_ring = deque(maxlen=180)  # (t, 16x16 signature) of recent camera reads
-        self._last_proc_sig = None      # signature of the last PROCESSED frame (dup gate)
-        self._last_ts_ms = 0            # last timestamp handed to detect_for_video (ms)
-        self._read_count = 0            # raw reads (rate watchdog); bus.frames counts processed
-        self._dedupe = False            # True when the capture is a real camera we opened
-        self._uniq_reopened_cam = None  # one-chance repeat reopen per camera (see unique watchdog)
-        self._reader = None             # _CamReader while a capture is open
-        self._reader_seq = 0            # sequence of the newest consumed frame
-        self._last_frame_wall = time.time()  # wall time of the newest frame (read-stall watchdog)
-        self._read_stalls = 0           # consecutive stall reopens (reset after a healthy minute)
-        self._read_stall_t = 0.0
+        # inference backend: what _load_model picked, and what the user last asked
+        # for so the System card can switch it live without a restart
+        self._backend_name = "mediapipe"
+        self._backend_seen = str(settings.get("backend") or "auto")
         self.sonar = None               # Sonar instance while enabled (experimental)
-        self._sonar_fail = None         # key that failed to start — backs off, retries
-        self._sonar_retry_t = 0.0       # wall time of the last start attempt
+        self._sonar_fail = None         # key that failed to start — no retry spam
         self._sonar_last_error = None
         # high-rate motion engine: this thread ingests camera-rate samples, the
         # CursorMotion emitter thread produces the 120-200 Hz absolute-move stream
         self.motion = CursorMotion(
             prediction_ms=45, smoothness=settings.get("smoothing"), max_rate=144,
-            speed_scale=max(1, bus.virtual_screen[2]) / 1920,
-            hold_px=float(settings.get("hold_px") or 0.0))
+            speed_scale=max(1, bus.virtual_screen[2]) / 1920)
         self.motion.set_output(self._emit_cursor)
         self._selector = G.PrimaryHandSelector()  # sticky primary-hand tracker
         self._active_hand = None        # index of the primary hand (preview highlight)
@@ -521,10 +348,6 @@ class Engine(threading.Thread):
         self.tel = Telemetry()
         self._prev_pose = "idle"
         self._infer_ms = 0.0
-        # fps from a TIME window (see _publish_stats): the old "% 15 frames"
-        # gate never fired on a still scene, so the UI chip read 0.0 forever
-        self._stat_t = time.time()
-        self._stat_n = 0
 
     # -- public controls (thread-safe) ---------------------------------------
     def arm(self, on):
@@ -539,47 +362,34 @@ class Engine(threading.Thread):
         return self._control.is_set()
 
     def stop(self):
-        self._stop.set()
-        # Stop the emitter HERE, not only in _run's tail: refresh_app joins the
-        # engine thread with a 3 s timeout, and a camera-open still inside its
-        # 12 s _open_bounded deadline meant the OLD CursorMotion kept emitting
-        # absolute moves for seconds after the "restart" returned.
-        try:
-            self.motion.stop()
-        except Exception:
-            pass
+        self._halt_evt.set()
 
     # -- lifecycle -----------------------------------------------------------
-    def _open_camera(self, index, use_cache=True):
+    def _open_camera(self, index):
         """Open the camera at the highest mode that actually DELIVERS the rate.
 
-        The decision is MEASURED (frames actually read), not requested, and it
-        runs in a short-lived subprocess: opening a camera can crash the whole
-        process at the driver level (seen in the wild when a virtual cam or a
-        Camo/NVIDIA-Broadcast chain is mid-restart), so the probe must never
-        take the app down with it. The processing downscale still happens in
-        software in the engine loop.
+        Runs on the FrameGrabber thread.  The decision is MEASURED (frames actually
+        read), not requested, and the measuring happens in a short-lived subprocess:
+        opening a camera can crash the whole process at the driver level (seen in the
+        wild when a virtual cam or a Camo/NVIDIA-Broadcast chain is mid-restart), so
+        the probe must never take the app down with it.
 
-        Fast path: the mode this camera landed on last time is tried directly
-        (the full ladder boots a helper exe per rung, ~5-6 s of startup). The
-        delivered-rate watchdog re-measures with the full ladder when the
-        cached mode turns out to trickle."""
+        2.6: the verdict is CACHED per (camera, fps).  Reconnects (unplug, stall, fps
+        change, switching back to a camera) reopen the mode the first open settled on:
+        one open instead of two probe subprocesses + one open, so a hiccup costs ~1 s
+        of tracking instead of 5-10 s of "camera busy".  A cached mode that no longer
+        opens is forgotten and the ladder re-measures.
+        """
         fps = 60 if int(settings.get("capture_fps") or 0) >= 60 else 30
-        if use_cache:
-            cache = settings.get("cam_mode_cache") or {}
-            cand = cache.get(str(int(index)))
-            if isinstance(cand, (list, tuple)) and len(cand) == 2:
-                try:
-                    w, h = int(cand[0]), int(cand[1])
-                except (TypeError, ValueError):
-                    w = h = 0
-                if w > 0 and h > 0:
-                    opened = self._open_mode(index, w, h, fps)
-                    if opened is not None:
-                        cap, delivered = opened
-                        self._cam_mode = delivered
-                        log.info("camera %s: using saved mode %sx%s", index, w, h)
-                        return cap
+        key = (int(index), fps)
+        mode = self._cam_mode_cache.get(key)
+        if mode is not None:
+            cap = self._open_mode(index, mode[0], mode[1], fps)
+            if cap is not None:
+                self._cam_mode = mode
+                return cap
+            log.info("camera %s: cached mode %sx%s no longer opens — re-measuring", index, *mode)
+            self._cam_mode_cache.pop(key, None)
         order = [(CAPTURE_W, CAPTURE_H), (640, 480)]
         for w, h in order:
             measured = self._probe_capture_fps(index, w, h, fps, CAMERA_PROBE_S)
@@ -591,19 +401,11 @@ class Engine(threading.Thread):
                     log.warning("camera %s: even 640x480 delivers only %.1f fps", index, measured)
                 elif (w, h) != (CAPTURE_W, CAPTURE_H):
                     log.info("camera %s: 720p delivered %.1f fps -> fell back to 640x480", index, measured)
-                cap = None
-                opened = self._open_mode(index, w, h, fps)
-                if opened is not None:
-                    cap, delivered = opened
+                cap = self._open_mode(index, w, h, fps)
                 if cap is None:
                     continue
-                self._cam_mode = delivered
-                try:
-                    cache = settings.get("cam_mode_cache") or {}
-                    cache[str(int(index))] = [int(w), int(h)]
-                    settings.set("cam_mode_cache", cache)
-                except Exception:
-                    pass
+                self._cam_mode = (w, h)
+                self._cam_mode_cache[key] = (w, h)
                 return cap
             log.info("camera %s: 720p trickles at %.1f fps -> trying 640x480", index, measured)
         return None
@@ -638,24 +440,7 @@ class Engine(threading.Thread):
 
     @staticmethod
     def _open_mode(index, w, h, fps):
-        """Open one (backend, resolution) attempt; None when it can't deliver a frame.
-
-        VERIFIES THE DELIVERED SIZE, not just that a frame arrived. Drivers
-        routinely ignore CAP_PROP_FRAME_WIDTH/HEIGHT and fall back to their own
-        default — measured live: asking cam0 for 640x480 returned 1280x720, and
-        in the field a held/degenerate stream returned 64x48. Accepting that
-        silently is what makes the hand landmarks jump: the engine only
-        downscales when proc_h < frame height, so a 48px frame reaches
-        MediaPipe untouched, where a hand is ~10 pixels of noise. The 1e filter
-        then smooths the path BETWEEN those jumps — "smooth but jumps
-        everywhere" — and _cam_mode still records the size we ASKED for, so
-        every watchdog that compares it against a rung decides on a lie.
-
-        A frame LARGER than requested is fine (the engine shrinks it in
-        software); only a degenerate fallback is rejected. Returns
-        (capture, (delivered_w, delivered_h)) so the caller records what the
-        driver ACTUALLY gave us, or None.
-        """
+        """Open one (backend, resolution) attempt; None when it can't deliver a frame."""
         for backend in (cv2.CAP_DSHOW, cv2.CAP_ANY):
             try:
                 cap = cv2.VideoCapture(index, backend)
@@ -663,168 +448,24 @@ class Engine(threading.Thread):
                     cap.release()
                     continue
                 try:
-                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc("MJPG"))
+                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
                 except Exception:
                     pass
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
                 cap.set(cv2.CAP_PROP_FPS, fps)
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                ok, frame = cap.read()
-                if ok and frame is not None:
-                    fh, fw = frame.shape[:2]
-                    if fw < CAMERA_MIN_W or fh < CAMERA_MIN_H:
-                        log.warning(
-                            "camera %s: asked for %sx%s but the driver delivered "
-                            "%sx%s (below %sx%s) — rejecting the mode, another app "
-                            "is likely holding the camera", index, w, h, fw, fh,
-                            CAMERA_MIN_W, CAMERA_MIN_H)
-                        cap.release()
-                        return None
-                    if (fw, fh) != (w, h):
-                        log.info("camera %s: asked %sx%s, driver delivered %sx%s%s",
-                                 index, w, h, fw, fh,
-                                 " (larger than asked — engine downscales)"
-                                 if fw * fh > w * h else "")
-                    return cap, (fw, fh)
+                ok, _ = cap.read()
+                if ok:
+                    return cap
                 cap.release()
             except Exception:
                 continue
         return None
 
-    @staticmethod
-    def _frame_sig(frame):
-        """(signature, brightness) — cheap content fingerprint for the dup gate.
-
-        Returns the frame mean alongside the signature so the black-frame
-        watchdog stops paying for a second strided pass over the full frame
-        (measured: 0.014 ms/read saved, and it now reports a proper AREA
-        average instead of a point sample that could miss a bright region and
-        read a lit frame as black).
-
-        NOTE: gray-then-resize is the faster order here — measured 0.535 vs
-        0.584 ms/frame for resize-then-gray on a 720p frame, because the
-        full-resolution colour conversion is SIMD-optimised and the resize
-        dominates either way. Do not "optimise" the order back.
-        """
-        g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        small = cv2.resize(g, (16, 16), interpolation=cv2.INTER_AREA).astype(np.int16)
-        m = int(small.mean())
-        return small - m, m
-
-    def _measure_unique_fps(self):
-        """(reads/s, unique frames/s) over the last ~2 s of camera reads.
-
-        Non-blocking: the loop feeds a cheap 16x16 signature per frame into
-        `_sig_ring`; duplicates (virtual cams, low-light auto-exposure) show
-        as pixel-identical consecutive signatures. A real sensor never repeats
-        exactly (noise/auto-gain), so identical == genuinely repeated."""
-        ring = self._sig_ring
-        if len(ring) < 10:
-            return None, None
-        t0, t1 = ring[0][0], ring[-1][0]
-        span = t1 - t0
-        if span < 0.8:
-            return None, None
-        reads = len(ring) / span
-        uniq = 0
-        prev = None
-        for _, sig in ring:
-            if prev is not None and not _is_dup_sig(sig, prev):
-                uniq += 1
-            prev = sig
-        return reads, uniq / span
-
-    def _open_with_retry(self, cam, attempts=15, use_cache=True):
-        cap = None
-        tries = 0
-        while cap is None and not self._stop.is_set() and tries < attempts:
-            cap = self._open_camera(int(cam), use_cache=use_cache)
-            tries += 1
-            if cap is None:
-                self.bus.error = f"camera {cam} busy — is another app using it?"
-                time.sleep(1.2)
-        return cap
-
-    def _open_bounded(self, cam, deadline=None, use_cache=True):
-        """`_open_with_retry` that can never block the engine for long: a wedged
-        driver can hang VideoCapture()/the probe itself. On timeout the daemon
-        helper is abandoned (if it later returns a capture, that handle is
-        garbage-collected). Returns the capture or None."""
-        deadline = CAMERA_OPEN_DEADLINE_S if deadline is None else deadline
-        box = {}
-
-        def work():
-            box["cap"] = self._open_with_retry(cam, use_cache=use_cache)
-
-        th = threading.Thread(target=work, daemon=True, name="HJ3-CamOpen")
-        th.start()
-        th.join(deadline)
-        if th.is_alive():
-            log.error("camera %s: open still running after %.0fs — driver looks stuck", cam, deadline)
-            return None
-        return box.get("cap")
-
-    def _start_reader(self):
-        """Wrap the current capture in a reader thread (idempotent)."""
-        self._stop_reader()
-        if self.capture is None:
-            return
-        self._reader = _CamReader(self.capture, max_hz=1.5 * float(self._target_fps))
-        self._reader_seq = 0
-        self._last_frame_wall = time.time()
-        self._reader.start()
-
-    def _stop_reader(self):
-        """Detach the reader. A read stuck in a driver can't be interrupted, so
-        the thread may be abandoned (daemon; it dies with the app). The app
-        never blocks on it — that is the whole point of the reader design."""
-        r = self._reader
-        self._reader = None
-        if r is None:
-            return
-        r.abandon()
-        r.join(timeout=1.0)
-        if r.is_alive():
-            log.info("camera reader did not exit within 1 s — abandoning it (driver stuck)")
-
-    def _stall_recover(self):
-        """No frames for CAMERA_STALL_S: the read (or the whole driver) is stuck.
-        Reopen bounded; give up with a clear error after repeated stalls.
-        Returns False when the engine should give up."""
-        self._read_stalls += 1
-        self._read_stall_t = time.time()
-        if _stall_decision(self._read_stalls, CAMERA_STALL_REOPENS) == "give_up":
-            self._stop_reader()
-            self.bus.error = ("camera keeps going silent — the driver looks stuck: close other camera "
-                              "apps or pick another camera, then click Refresh app")
-            log.error("camera %s: %d stalls in a row — giving up (driver stuck)",
-                      self._cam_index, self._read_stalls)
-            return False
-        log.warning("camera %s: no frames for %.1fs — reopening (stall %d/%d)",
-                    self._cam_index, time.time() - self._last_frame_wall,
-                    self._read_stalls, CAMERA_STALL_REOPENS)
-        self._stop_reader()
-        self.capture = None
-        cap = self._open_bounded(self._cam_index, use_cache=False)   # re-measure after a stall
-        if cap is None:
-            self.bus.error = (f"camera {self._cam_index} open is not responding — the driver looks "
-                              "stuck; click Refresh app")
-            return False
-        self.capture = cap
-        self._start_reader()
-        self._last_proc_sig = None
-        self._sig_ring.clear()
-        self.bus.error = None
-        log.info("camera %s reopened after stall", self._cam_index)
-        return True
-
-    def request_camera(self, idx, use_cache=True):
-        """Ask the engine thread to switch cameras on its next frame.
-
-        use_cache=False forces the full 720p->640x480 measurement ladder even
-        when a cached mode exists (used when re-measuring after bad delivery)."""
-        self._cam_request = (int(idx), bool(use_cache))
+    def request_camera(self, idx):
+        """Ask the engine thread to switch cameras on its next frame."""
+        self._cam_request = int(idx)
 
     def request_driver_settings(self):
         """Open the camera driver's own property page (DirectShow). This is where
@@ -832,46 +473,117 @@ class Engine(threading.Thread):
         reason a camera quietly drops to ~7-10 fps in a dim room."""
         self._driver_dialog = True
 
-    def _cam_device_name(self):
-        """Name of the active camera index (pygrabber, cached per app run; ""
-        when enumeration is unavailable)."""
+    # -- camera health (grabber thread owns the device; this only reports) -----
+    def _sync_camera_status(self):
+        g = self.grabber
+        now = time.perf_counter()
+        if g is None or now - self._cam_status_t < 1.0:
+            return
+        self._cam_status_t = now
+        bus = self.bus
+        if g.error:
+            if bus.error != g.error:
+                bus.error = g.error
+            self._cam_err_set = True
+        elif self._cam_err_set:
+            self._cam_err_set = False
+            bus.error = None
+        reads, uniq = g.rates()
+        if reads:
+            bus.cam_reads, bus.cam_unique = round(reads, 1), round(uniq, 1)
+            # the camera itself is the bottleneck: tell the user, once, what to do.
+            # (2.6: warn only — re-opening the camera never fixed a dim room, it just
+            # dropped tracking for seconds)
+            if uniq < 18.0:
+                self._slow_cam_streak += 1
+                if self._slow_cam_streak >= 8 and not bus.warning:
+                    bus.warning = (f"camera delivers only ~{uniq:.0f} new frames/s (tracking can't be "
+                                   "smoother than that). Usually dim light: add light, or open Camera "
+                                   "driver settings and turn off low-light compensation / dynamic frame rate")
+            else:
+                self._slow_cam_streak = 0
+                if bus.warning and "new frames/s" in bus.warning:
+                    bus.warning = None
+        # black frames: lens cover / privacy switch / another app owning the device
+        if g.connected and g.frames > 30 and g.brightness < 2.0:
+            if not self._dark_since:
+                self._dark_since = now
+            elif now - self._dark_since > 10.0 and not bus.warning:
+                bus.warning = ("camera is delivering black frames — check the lens cover, "
+                               "Windows camera privacy settings, or close other camera apps")
+                log.warning("camera black-frame watchdog tripped")
+        else:
+            self._dark_since = 0.0
+            if bus.warning and "black frames" in bus.warning:
+                bus.warning = None
+
+    def camera_stats(self):
+        """For diagnostics: what the camera thread sees."""
+        g = self.grabber
+        if g is None:
+            return {}
+        reads, uniq = g.rates()
+        return {"connected": g.connected, "size": g.size, "mode": self._cam_mode, "frames": g.frames,
+                "dropped": g.dropped, "reopens": g.reopens, "reads_per_s": reads, "new_per_s": uniq,
+                "brightness": round(g.brightness, 1), "error": g.error}
+
+    def _shutdown_camera_and_preview(self):
         try:
-            if self._cam_names is None:
-                self._cam_names = {int(c["index"]): str(c.get("name") or "")
-                                   for c in list_cameras()}
-            return self._cam_names.get(int(self._cam_index), "")
+            if self.grabber is not None:
+                self.grabber.stop()
         except Exception:
-            return ""
+            log.exception("grabber stop failed")
+        try:
+            self.preview.stop()
+        except Exception:
+            pass
+
+    # -- the pointer: native OS cursor (2.6) or the legacy overlay + ShowCursor ----
+    def _native_cursor(self):
+        if self.native is None:
+            self.native = NativeCursor(Win32CursorBackend())
+            self._native_scale = system_dpi_scale()
+        return self.native
+
+    def _release_native(self):
+        nc = self.native
+        if nc is not None and nc.active:
+            nc.restore()
+        self.bus.native_active = False
+
+    def _update_cursor_visual(self, want_custom, style):
+        """want_custom: the orb/ring should be THE pointer right now."""
+        bus = self.bus
+        if (want_custom and sys.platform == "win32" and style in ("sky", "glow")
+                and settings.get("cursor_mode") == "native"):
+            nc = self._native_cursor()
+            if not nc.failed:
+                if not nc.matches(style, self._native_scale):
+                    if nc.active:
+                        nc.restore()
+                    nc.install(style, self._native_scale)
+                if nc.active:
+                    nc.set_press(bus.press > 0.3)
+                    bus.native_active = True
+                    if self._cursor_hidden:                    # leftover legacy hide
+                        wi.show_cursor(True)
+                        self._cursor_hidden = False
+                    return
+        # fallback / opt-out: overlay draws the orb, the OS arrow is hidden the old way
+        self._release_native()
+        if want_custom != self._cursor_hidden:
+            wi.show_cursor(not want_custom)
+            self._cursor_hidden = want_custom
 
     def _load_model(self):
-        """Load the configured inference backend.
+        """Build the landmarker for the current `backend` setting.
 
-        'auto'      — the ACCURATE engine: MediaPipe with the full bundled
-                      model. ONNX is deliberately NOT auto-selected (see below).
-        'onnx'      — ONNX Runtime (DirectML GPU, ~0.6 ms/frame). Falls back to
-                      MediaPipe if it cannot start — a broken runtime must never
-                      brick the app. OPT-IN: it runs the LITE landmark model, and
-                      the measured landmark error is pose-dependent, not a fixed
-                      offset — vs MediaPipe's full model on the same frames:
-
-                          thumb_up    : mediapipe 0.1px mean  |  onnx  6.1px mean
-                          pointing_up : mediapipe 3.6px mean  |  onnx 31.2px mean
-                                                                    (max 86px)
-
-                      A tens-of-pixels displacement that changes with pose is
-                      exactly what reads as "wrong pose / freaking out": the
-                      pose classifier flips and the cursor lurches. The speed
-                      win is real but unnecessary — MediaPipe's ~7.5 ms still
-                      fits the 16.7 ms budget at 60 fps.
-        'mediapipe' — the original CPU pipeline, explicit form.
-
-        Custom .task models and 2-hand mode always use MediaPipe: the ONNX
-        port covers the bundled lite model with one hand."""
+        Custom .task models and 2-hand mode always use MediaPipe: the ONNX port
+        covers the bundled lite model with one hand only. ONNX is opt-in because
+        it trades landmark accuracy for speed (see settings.backend)."""
         backend = str(settings.get("backend") or "auto")
         hands = int(settings.get("max_hands") or 1)
         wants_custom = bool(str(settings.get("model_file") or "").strip())
-        # 'onnx' ONLY: 'auto' must mean the accurate engine. Trading landmark
-        # accuracy for 7 ms nobody needs is how "the model got worse" happened.
         if backend == "onnx" and hands == 1 and not wants_custom:
             try:
                 from .hand_onnx import OnnxHandLandmarker
@@ -882,41 +594,21 @@ class Engine(threading.Thread):
                 log.info("inference backend: %s", self._backend_name)
                 return
             except Exception as e:
+                # Any doubt at all (missing onnxruntime, no DX12 GPU, bad file)
+                # and we fall back: never leave the app with no tracker.
                 log.warning("onnx backend unavailable (%s: %s) — using mediapipe",
                             type(e).__name__, e)
+                settings.set("backend", "mediapipe")
         path = _task_path(settings.get("model_file"))
         if not os.path.exists(path):
             # a stored custom model that vanished (deleted/renamed) -> bundled
             log.warning("model %s missing — falling back to the bundled default", path)
             settings.set("model_file", "")
             path = _task_path("")
-        from mediapipe import Image as MpImage, ImageFormat
-        from mediapipe.tasks.python import vision
-        self._mp_image_cls, self._mp_image_fmt = MpImage, ImageFormat
+        hands = int(settings.get("max_hands") or 1)
         self.landmarker = vision.HandLandmarker.create_from_options(
             _landmarker_options(path, hands))
         self._backend_name = "mediapipe"
-        log.info("inference backend: mediapipe (hands=%s%s)",
-                 hands, ", custom model" if wants_custom else "")
-
-    def _rebuild_landmarker(self):
-        """Close + reload the landmarker. False when nothing usable loads.
-
-        The ONLY recovery from a native crash inside detect_for_video: an access
-        violation leaves the C++ graph in an undefined state, and the old code
-        kept feeding that same corrupted landmarker for up to 15 more failures.
-        """
-        try:
-            if self.landmarker is not None:
-                self.landmarker.close()
-        except Exception:
-            pass
-        try:
-            self._load_model()
-        except Exception:
-            log.exception("landmarker rebuild failed")
-            return False
-        return self.landmarker is not None
 
     def run(self):
         try:
@@ -924,8 +616,21 @@ class Engine(threading.Thread):
         except Exception as e:
             log.exception("engine crashed")
             self.bus.error = f"engine crashed: {e}"
+        finally:
+            self._shutdown_camera_and_preview()
+            try:
+                self._release_native()
+            except Exception:
+                pass
 
     def _run(self):
+        try:
+            self._load_model()
+        except Exception as e:
+            log.error("model load failed: %s", e)
+            self.bus.error = f"model load failed: {e}"
+            return
+        log.info("model loaded: %s (num_hands=%s)", MODEL_NAME, self._hands_seen)
         fake = os.environ.get("HJ3_FAKE_CAM")
         if fake:
             img = cv2.imread(fake)
@@ -936,33 +641,20 @@ class Engine(threading.Thread):
                 log.warning("HJ3_FAKE_CAM=%s could not be read — falling back to camera", fake)
         cam = int(settings.get("camera_index"))
         self._cam_index = cam
-        cam_box = {}
-        cam_th = None
-        if not (self.capture and self.capture.isOpened()):  # reuse a pre-opened capture (probe flow)
-            # open the camera WHILE the model loads — the mode probe boots a
-            # helper exe per rung, and serialising it after the model cost
-            # several seconds of startup
-            def _boot_open():
-                cam_box["cap"] = self._open_bounded(cam)
-            cam_th = threading.Thread(target=_boot_open, daemon=True, name="HJ3-CamBoot")
-            cam_th.start()
-        try:
-            self._load_model()
-        except Exception as e:
-            log.error("model load failed: %s", e)
-            self.bus.error = f"model load failed: {e}"
-            return
-        log.info("model loaded: %s (num_hands=%s)", MODEL_NAME, self._hands_seen)
-        if cam_th is not None:
-            cam_th.join(timeout=CAMERA_OPEN_DEADLINE_S + 3)
-            self.capture = cam_box.get("cap")
-            self._dedupe = self.capture is not None        # dup gate: real cams only (probe/fake feeds differ every frame)
-        if self.capture is None:
-            log.error("camera %s not available", cam)
-            self.bus.error = f"camera {cam} unavailable — close other camera apps and reopen"
-            return
-        self._start_reader()
-        log.info("camera %s open, engine loop running", cam)
+        preset = self.capture if (self.capture and self.capture.isOpened()) else None   # fake cam / probe flow
+        self.capture = None
+
+        def open_fn(index):
+            nonlocal preset
+            if preset is not None:
+                cap, preset = preset, None
+                return cap
+            return self._open_camera(int(index))
+
+        self.grabber = FrameGrabber(open_fn, cam)
+        self.grabber.start()
+        self.preview.start()
+        log.info("camera %s requested, engine loop running", cam)
         self.start_t = time.time()
         first_frame_logged = False
         mapper = G.TravelMapper(sensitivity=settings.get("sensitivity"))
@@ -977,214 +669,28 @@ class Engine(threading.Thread):
         except Exception:
             pass
         last_lost = 0.0
-        ema_dt = 1 / 30
         last_beat = 0.0
         consecutive_errors = 0
-        dark_since = 0.0
-        while not self._stop.is_set():
+        last_seq = 0
+        while not self._halt_evt.is_set():
             req = self._cam_request
             if req is not None:
                 self._cam_request = None
-                if isinstance(req, tuple):
-                    req, req_use_cache = req
-                else:
-                    req_use_cache = True
-                log.info("camera switch requested -> %s", req)
-                # OPEN-FIRST swap: keep the old handle (and its reader thread)
-                # alive while the new one opens, then release the old. Virtual
-                # cams (Camo) AUTO-PAUSE when they see zero consumers and never
-                # un-pause by themselves — a release-then-open gap can kill a
-                # LIVE feed for good (observed: 10.5 new frames/s -> reopen ->
-                # 0.0 forever; that was the app's own doing, 2.4.0 had no
-                # reopens). Opening first means the vcam never sees a gap.
-                prev_capture = self.capture
-                newcap = self._open_bounded(req, use_cache=req_use_cache)
-                if newcap is None and prev_capture is not None and self._reader is not None:
-                    # e.g. a physical camera that refuses a second handle while
-                    # the old one is open: fall back to release-then-open
-                    self._stop_reader()
-                    self.capture = None
-                    newcap = self._open_bounded(req, use_cache=req_use_cache)
-                if newcap is None:
-                    log.error("camera switch to %s failed", req)
-                    self.bus.error = f"camera {req} unavailable"
-                    # an open-first failure leaves the old feed untouched (kept
-                    # above); only the release-first fallback can end up empty —
-                    # the stall watchdog restores it
-                else:
-                    self._stop_reader()          # stops + releases the OLD handle
-                    self.capture = newcap
-                    self._cam_index = req
-                    self._dedupe = True
-                    self.bus.error = None
-                    self._frozen_streak = 0
-                    self._read_stalls = 0
-                    self._last_proc_sig = None
-                    self._uniq_reopened_cam = None   # a manual switch re-arms the one-chance reopen
-                    self._sig_ring.clear()
-                    self._start_reader()
-                    log.info("camera switched to %s", req)
+                self._cam_index = req
+                self.grabber.request_index(req)      # non-blocking: the grabber thread reconnects
             if self._driver_dialog:
                 self._driver_dialog = False
-                try:
-                    self.capture.set(cv2.CAP_PROP_SETTINGS, 1)   # modal; returns when closed
-                except Exception:
-                    log.exception("camera driver settings dialog failed")
-            # consume from the reader thread: a driver-blocked read() shows up
-            # here as a get() timeout, never as a wedged engine loop
-            if self._reader is None:
-                time.sleep(0.05)                  # between cameras: don't spin
-                item = None
-            else:
-                item = self._reader.get(self._reader_seq, 0.25)
-            if item is None:
-                if time.time() - self._last_frame_wall > CAMERA_STALL_S and not self._stall_recover():
-                    return
+                self.grabber.request_driver_dialog()
+            # newest frame only: a slow iteration drops frames instead of queueing them
+            got = self.grabber.get(last_seq, timeout=0.25)
+            self._sync_camera_status()
+            if got is None:
                 continue
-            self._reader_seq, t_read, frame = item
-            if frame is None:                     # the driver reports failed reads
-                if time.time() - self._last_frame_wall > CAMERA_STALL_S and not self._stall_recover():
-                    return
-                time.sleep(0.05)
-                continue
-            self._last_frame_wall = t_read
-            if self._read_stalls and time.time() - self._read_stall_t > 60.0:
-                self._read_stalls = 0             # a healthy minute re-arms the reopen budget
-            # TIMESTAMP = the moment the frame arrived. Everything downstream (landmark
-            # filters, pose dwell, click timing, cursor velocity) works from this, not
-            # from "after inference": inference time varies 10-30 ms frame to frame and
-            # stamping after it injects that noise into every dt and velocity estimate.
-            # cheap content signature for the unique-frame watchdog + dup gate
-            # (non-blocking) — also yields the frame brightness for free, so the
-            # black-frame watchdog no longer makes a second pass over the frame
-            sig = None
-            dark_now = False
-            try:
-                sig, brightness = self._frame_sig(frame)
-                self._sig_ring.append((time.time(), sig))
-                dark_now = brightness < 2.0
-            except Exception:
-                pass
-            self._read_count += 1
-            # black-frame watchdog: time-based and READ-based, so it also fires
-            # when a camera repeats ONE black frame (the old per-processed-frame
-            # counter never advanced for duplicates — this exact case was blind).
-            self._last_frame_dark = dark_now
-            if dark_now:
-                if dark_since == 0.0:
-                    dark_since = time.time()
-                elif time.time() - dark_since > 3.0 and not self.bus.warning:
-                    self.bus.warning = ("camera is delivering black frames — check the lens cover, "
-                                        "Windows camera privacy settings, or the virtual camera's source")
-                    log.warning("camera black-frame watchdog tripped")
-            else:
-                dark_since = 0.0
-                if self.bus.warning and "black frames" in self.bus.warning:
-                    self.bus.warning = None
-            # delivered-rate watchdog: if the RAW read feed degrades below the usable
-            # threshold after opening (USB power saving, another app), reopen
-            # once so the 720p->640x480 ladder can re-measure. Never reopens
-            # when already on the lowest rung. (Reads, not processed frames:
-            # a repeating virtual cam answers plenty of reads.)
-            wnow = time.time()
-            if wnow - self._rate_check_t >= 3.0:
-                dframes = self._read_count - self._rate_check_frames
-                rate = dframes / max(1e-3, wnow - self._rate_check_t)
-                self._rate_check_t = wnow
-                self._rate_check_frames = self._read_count
-                if 0.5 < rate < CAMERA_MIN_FPS and self._cam_mode != (640, 480):
-                    self._rate_low_streak += 1
-                    need = 1 if rate < 5.0 else 2       # clearly trickling: act on the first window
-                    if self._rate_low_streak >= need and wnow - self._rate_reopen_t > 90.0:
-                        self._rate_reopen_t = wnow
-                        self._rate_low_streak = 0
-                        log.warning("delivered rate %.1f fps — reopening camera to re-measure", rate)
-                        self.request_camera(self._cam_index, use_cache=False)
-                else:
-                    self._rate_low_streak = 0
-            # unique-frame watchdog: virtual cams and low-light auto-exposure
-            # answer full reads but REPEAT frames (30 reads/s, ~10 new/s) —
-            # the cursor then stutters at the unique rate. Detect + re-measure.
-            if wnow - self._uniq_check_t >= 7.0:
-                self._uniq_check_t = wnow
-                rrate, urate = self._measure_unique_fps()
-                if rrate and urate is not None:
-                    self.bus.cam_reads = round(rrate, 1)
-                    self.bus.cam_unique = round(urate, 1)
-                    # the camera itself is the bottleneck: tell the user, once, and
-                    # name the actual device — the reason depends on WHAT it is, not
-                    # on the read rate (a deep-idle virtual cam answers slowly, a
-                    # busy one answers fast while repeating its standby screen).
-                    if urate < 18.0:
-                        self._slow_cam_streak += 1
-                        if self._slow_cam_streak >= 2 and not self.bus.warning:
-                            name = self._cam_device_name()
-                            did = f"camera {self._cam_index}" + (f" ({name})" if name else "")
-                            if self._last_frame_dark:
-                                self.bus.warning = (f"{did} is delivering black frames — check the lens "
-                                                    "cover or Windows camera privacy settings; for a virtual "
-                                                    "camera, check its source app (it may be paused or "
-                                                    "disconnected)")
-                            elif urate < 6.0:
-                                # A still scene and a paused source look IDENTICAL from
-                                # here (both send one unchanging frame) — say what is
-                                # actually observed and what each cause would mean.
-                                self.bus.warning = (f"{did}: the picture isn't changing (~{urate:.0f} new "
-                                                    "frames/s). Normal while the scene is genuinely still — if it "
-                                                    "stays frozen while you MOVE, the camera isn't delivering "
-                                                    "video: unpause / reconnect its source (Camo, NVIDIA "
-                                                    "Broadcast, OBS)"
-                                                    + (". For Camo also turn OFF its auto-pause option"
-                                                       if _is_virtual_cam_name(name) else ""))
-                            elif _is_virtual_cam_name(name):
-                                self.bus.warning = (f"{did} delivers only ~{urate:.0f} new frames/s — its source "
-                                                    "is updating slowly (phone on Wi-Fi / source app lagging); "
-                                                    "tracking moves at exactly that rate. A directly connected "
-                                                    "camera would be smoother")
-                            else:
-                                self.bus.warning = (f"{did} delivers only ~{urate:.0f} new frames/s (tracking can't "
-                                                    "be smoother than that). Usually dim light: add light, or open "
-                                                    "Camera driver settings and turn off low-light compensation / "
-                                                    "dynamic frame rate")
-                    else:
-                        self._slow_cam_streak = 0
-                        if self.bus.warning and "new frames/s" in self.bus.warning:
-                            self.bus.warning = None
-                    if urate < 6.0 and urate < 0.45 * rrate:
-                        self._uniq_bad_streak += 1
-                        log.info("camera unique-frame rate %.1f of %.1f reads/s", urate, rrate)
-                        # one chance per camera: reopen once in case the driver got into a
-                        # stale-buffer state; a chronic repeater (virtual cam) can't be
-                        # fixed by reopening — the pipeline now handles repeats instead.
-                        # NOTE the < 6.0 gate: a feed delivering ~10/s is WORKING — the
-                        # old '< 45% of reads' test alone fired on it, and the reopen
-                        # itself could kill a virtual cam (auto-pause on consumer loss).
-                        if (self._frozen_streak < 2 and self._uniq_bad_streak >= 2
-                                and wnow - self._uniq_reopen_t > 120.0
-                                and self._uniq_reopened_cam != self._cam_index):
-                            self._uniq_reopen_t = wnow
-                            self._uniq_bad_streak = 0
-                            self._uniq_reopened_cam = self._cam_index
-                            log.warning("camera repeats frames (%.1f unique of %.1f reads/s) — reopening once",
-                                        urate, rrate)
-                            self.request_camera(self._cam_index)
-                    else:
-                        self._uniq_bad_streak = 0
-                    # still-picture detection: INFORMATIONAL ONLY (2.5.5). From the
-                    # outside, a genuinely still scene and a paused/dead source are
-                    # indistinguishable (both send one unchanging frame), and the
-                    # duplicate gate already keeps stale frames out of the pipeline —
-                    # so this must never halt the cursor or raise an error. The old
-                    # halt+error read as "the app crashed" on a healthy camera the
-                    # moment the user stopped moving (and 2.4.0 never did that).
-                    self._frozen_streak, faction = _frozen_cam_state(urate, self._frozen_streak)
-                    if faction == "error":
-                        log.info("camera %s: still picture (~%.1f new frames/s) — tracking resumes when "
-                                 "frames change", self._cam_index, urate)
-                    elif faction == "clear":
-                        if self.bus.warning and "picture isn't changing" in self.bus.warning:
-                            self.bus.warning = None
-                        log.info("camera live again (%.1f new frames/s)", urate)
+            frame, t_read, last_seq = got
+            # TIMESTAMP = perf_counter at the instant read() returned on the grabber
+            # thread. Everything downstream (landmark filters, pose dwell, click
+            # timing, cursor velocity) works from this clock; the visuals the
+            # overlay compares with time.time() use their own wall clock.
             if not first_frame_logged:
                 first_frame_logged = True
                 log.info("first frame captured %sx%s (target %s Hz, num_hands=%s)",
@@ -1194,13 +700,10 @@ class Engine(threading.Thread):
             # to interpolate across; at ~10 fps feeds the slider value alone
             # leaves the cursor jumping between samples.
             pred = _effective_prediction(cfg["prediction_ms"], self._last_dt)
-            if (cfg["smoothing"] != self._smoothing_seen or pred != self._pred_seen
-                    or float(cfg.get("hold_px") or 0.0) != self._hold_seen):
+            if cfg["smoothing"] != self._smoothing_seen or pred != self._pred_seen:
                 self._smoothing_seen = cfg["smoothing"]
                 self._pred_seen = pred
-                self._hold_seen = float(cfg.get("hold_px") or 0.0)
-                self.motion.configure(smoothness=cfg["smoothing"], prediction_ms=pred,
-                                      hold_px=self._hold_seen)
+                self.motion.configure(smoothness=cfg["smoothing"], prediction_ms=pred)
             mapper.sensitivity = cfg["sensitivity"]
             clicks.pinch.threshold = cfg["click_threshold"]
             clicks.drag_px = cfg["drag_px"]
@@ -1215,58 +718,49 @@ class Engine(threading.Thread):
             hands = int(cfg.get("max_hands") or 1)
             if hands != self._hands_seen:
                 self._hands_seen = hands
-                if self._rebuild_landmarker():
+                try:
+                    self.landmarker.close()
+                except Exception:
+                    pass
+                try:
+                    self._load_model()
                     log.info("landmarker reloaded (num_hands=%s)", hands)
-                else:
+                except Exception:
                     log.exception("landmarker reload failed")
+            # backend change -> rebuild the landmarker on the new stack
+            backend_now = str(cfg.get("backend") or "auto")
+            if backend_now != self._backend_seen:
+                self._backend_seen = backend_now
+                try:
+                    self.landmarker.close()
+                except Exception:
+                    pass
+                try:
+                    self._load_model()
+                    log.info("inference backend switched -> %s", self._backend_name)
+                except Exception:
+                    log.exception("backend switch failed")
             # model change -> rebuild the landmarker on the new file (live switch;
             # a bad file falls back to the bundled default instead of dying)
             model_now = str(cfg.get("model_file") or "")
             if model_now != self._model_seen:
                 self._model_seen = model_now
-                if self._rebuild_landmarker():
+                try:
+                    self.landmarker.close()
+                except Exception:
+                    pass
+                try:
+                    self._load_model()
                     log.info("model switched -> %s", _task_base(model_now) or MODEL_NAME)
-                else:
+                except Exception:
                     log.exception("model switch failed — reverting to the bundled default")
                     settings.set("model_file", "")
                     self._model_seen = ""
-                    self._rebuild_landmarker()
-            # inference-backend change -> rebuild the landmarker on the other runtime
-            backend_now = str(cfg.get("backend") or "auto")
-            if backend_now != self._backend_seen:
-                self._backend_seen = backend_now
-                if self._rebuild_landmarker():
-                    log.info("inference backend switched -> %s", self._backend_name)
-                else:
-                    log.exception("backend switch failed")
+                    try:
+                        self._load_model()
+                    except Exception:
+                        log.exception("bundled model reload failed")
 
-            # ------- duplicate-frame gate (virtual cams) ------------------------
-            # Camo / NVIDIA Broadcast / OBS answer every read by repeating the last
-            # frame until their source produces a new one (the user's log: "8.5
-            # unique of 54.7 reads/s"). Feeding those repeats downstream puts the
-            # real 67 ms of hand motion into an 18 ms dt -> velocity ~3.7x too high
-            # -> the 1-euro cutoff boost passes each new frame almost unfiltered ->
-            # the cursor lurches on every update and stalls in between. That IS the
-            # "jitters / not smooth / delayed" feel. Drop repeats here: inference,
-            # landmark filter, click timing and motion all advance only on genuinely
-            # new frames, so every dt is honest; the emitter interpolates across
-            # the (now longer, correctly measured) gaps. Also skips ~80% of the
-            # CPU work on a repeating camera. Real cameras never repeat exactly
-            # (sensor noise), so this only fires for duplicates.
-            if self._dedupe and sig is not None and _is_dup_sig(sig, self._last_proc_sig):
-                # pace against t_read (a WALL clock) — mixing perf_counter with
-                # t_read here once slept for ~56 years: budget - (perf_counter -
-                # time.time()) is a ~1.7e9-positive number, so the engine froze
-                # on the first repeated frame (any static scene on a vcam).
-                wait = budget_dup = 1.0 / self._target_fps
-                spent = time.time() - t_read
-                wait -= spent
-                if wait > 0:                  # vcams answer instantly: don't spin
-                    time.sleep(min(wait, budget_dup))
-                continue
-            self._last_proc_sig = sig
-
-            t0 = time.perf_counter()
             try:
                 # software downscale (no driver crops): the camera delivers its
                 # native mode, we shrink the FULL frame to the processing size
@@ -1278,42 +772,36 @@ class Engine(threading.Thread):
                 frame = cv2.flip(frame, 1)  # selfie view: hand right = screen right
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 t_inf = time.perf_counter()
-                # MediaPipe VIDEO mode requires a STRICTLY INCREASING timestamp.
-                # int(perf_counter()*1000) repeats whenever two frames land in the
-                # same millisecond, and a repeated/regressed timestamp drives the
-                # native graph into an undefined state — observed live as
-                # "OSError: access violation reading 0x10" inside
-                # detect_for_video. Bump by 1 ms rather than trust the clock.
-                ts_ms = int(t0 * 1000)
-                if ts_ms <= self._last_ts_ms:
+                ts_ms = int(t_read * 1000)
+                if ts_ms <= self._last_ts_ms:           # VIDEO mode demands strictly increasing ms
                     ts_ms = self._last_ts_ms + 1
                 self._last_ts_ms = ts_ms
-                if self._mp_image_cls is not None:
-                    res = self.landmarker.detect_for_video(
-                        self._mp_image_cls(image_format=self._mp_image_fmt.SRGB, data=rgb),
-                        ts_ms)
-                else:
-                    # ONNX takes a RAW array as BGR (see hand_onnx.detect_for_video:
-                    # "direct callers pass BGR arrays"). Passing `rgb` here swapped
-                    # red and blue on every frame — measured, palm detection went
-                    # from 1 hand to 0 on the official test images. `frame` is the
-                    # flipped BGR original, which is what this branch must feed.
+                # ONNX wants the RAW flipped BGR array; MediaPipe wants an SRGB
+                # MpImage. Feeding `rgb` to ONNX swaps red/blue every frame and
+                # palm detection drops from 1 hand to 0 — measured, not theory.
+                if self._backend_name.startswith("onnx"):
                     res = self.landmarker.detect_for_video(frame, ts_ms)
+                else:
+                    res = self.landmarker.detect_for_video(
+                        MpImage(image_format=ImageFormat.SRGB, data=rgb), ts_ms)
                 self._infer_ms = (time.perf_counter() - t_inf) * 1000.0
             except Exception:
                 consecutive_errors += 1
-                # A native exception (access violation / OSError from the C++
-                # graph) is NOT a transient error: the landmarker's internal
-                # state is now undefined, so feeding it more frames is exactly
-                # what turns one bad frame into a hard crash. Rebuild on the
-                # FIRST failure — the old code waited for 15.
-                log.exception("inference failed (%d consecutive) — rebuilding the landmarker",
-                              consecutive_errors)
-                if self._rebuild_landmarker():
-                    consecutive_errors = 0
-                    time.sleep(0.05)
-                    continue
-                if consecutive_errors > 8:
+                log.exception("inference failed (%d consecutive)", consecutive_errors)
+                if consecutive_errors == 15:
+                    log.warning("recreating the landmarker after repeated inference errors")
+                    try:
+                        self.landmarker.close()
+                    except Exception:
+                        pass
+                    try:
+                        self._load_model()
+                        consecutive_errors = 0
+                        time.sleep(0.2)
+                        continue
+                    except Exception:
+                        log.exception("landmarker recreate failed")
+                if consecutive_errors > 45:
                     self.bus.error = "inference keeps failing — click Refresh app"
                     return
                 time.sleep(0.05)
@@ -1377,26 +865,25 @@ class Engine(threading.Thread):
                         if now - last_lost > 0.9:
                             self._mouse_up("left")
                 self._draw_preview(frame, res, cfg, now)
-                self._publish_stats(t0, res)
+                self._publish_stats(t_read, res)
             except Exception:
                 log.exception("frame processing failed")
             try:
                 self._sync_sonar(cfg)
             except Exception:
                 log.exception("sonar sync failed")
-            # pace to the target rate: an uncapped loop starves the UI thread of GIL
-            spent = time.perf_counter() - t0
-            budget = 1.0 / self._target_fps
-            if spent < budget:
-                time.sleep(budget - spent)
+            # no pacing sleep any more: the loop blocks in grabber.get() until the
+            # camera has a NEW frame, so it runs at the camera's rate by construction
             if now - last_beat > 5:
                 last_beat = now
                 log.info("beat frames=%s fps=%.1f lat=%.1fms armed=%s found=%s err=%s",
                           self.bus.frames, self.bus.fps, self.bus.latency_ms,
                           self.armed, self.bus.found, self.bus.error)
         self.motion.stop()
-        # restore the OS cursor from THIS thread before exiting (ShowCursor is thread-affine)
+        self._shutdown_camera_and_preview()
+        # give the user's own cursors back before exiting
         try:
+            self._release_native()
             wi.show_cursor(True)
             self._cursor_hidden = False
         except Exception:
@@ -1404,13 +891,7 @@ class Engine(threading.Thread):
 
     # -- sonar supervision (experimental; never drives the cursor) -----------
     def _sync_sonar(self, cfg):
-        """Start/stop/restart the sonar sensing to match the settings.
-
-        Retries with backoff instead of latching: the old `_sonar_fail` key was
-        written on the FIRST failure and never cleared, so a mic that was
-        briefly busy at startup (another app, a device still waking) left the
-        sonar dead for the whole session until the user re-picked a device.
-        """
+        """Start/stop/restart the sonar sensing to match the settings."""
         want = bool(cfg.get("sonar_enabled"))
         key = (int(cfg.get("sonar_in_device", -1)), int(cfg.get("sonar_out_device", -1)),
                int(cfg.get("sonar_tone", 19000)))
@@ -1420,37 +901,22 @@ class Engine(threading.Thread):
                 self.sonar = None
                 log.info("sonar stopped")
             self._sonar_fail = None
-            self._sonar_retry_t = 0.0
             return
         if self.sonar is not None and self.sonar.key != key:
             self.sonar.stop()
             self.sonar = None
-        if self.sonar is None:
-            now = time.time()
-            if self._sonar_fail == key and now - self._sonar_retry_t < SONAR_RETRY_S:
-                return
-            self._sonar_retry_t = now
-            from .sonar import Sonar
-            s = Sonar(in_dev=key[0], out_dev=key[1], tone=key[2])
-            # start_async: opening two PortAudio streams can block for tens of
-            # ms, which used to stall the cursor loop mid-frame. The join is
-            # bounded (ms in the normal case) purely so the failure is visible
-            # to this frame instead of a later one.
-            s.start_async().join(timeout=SONAR_BOOT_S)
-            if s.start_error:
-                self._sonar_fail = key
-                self._sonar_last_error = s.start_error
-                # a dead instance must NOT stay in self.sonar or the retry
-                # branch above would never be reached again
-                s.stop()
-                self.sonar = None
-                log.warning("sonar unavailable (retrying in %ds): %s",
-                            SONAR_RETRY_S, s.start_error)
-            else:
+        if self.sonar is None and self._sonar_fail != key:
+            try:
+                from .sonar import Sonar
+                s = Sonar(in_dev=key[0], out_dev=key[1], tone=key[2])
+                s.start()
                 self.sonar = s
-                self._sonar_fail = None
                 self._sonar_last_error = None
                 log.info("sonar started: %s", s.status())
+            except Exception as e:
+                self._sonar_fail = key
+                self._sonar_last_error = f"{type(e).__name__}: {e}"
+                log.warning("sonar unavailable: %s", self._sonar_last_error)
 
     # -- per-frame processing ------------------------------------------------
     def _process_hand(self, lms, mapper, clicks, scroll, cfg, now, frame, world=None):
@@ -1463,8 +929,15 @@ class Engine(threading.Thread):
         pose = self.pose_tr.update(raw_pose, now, holding=clicks.left_down or clicks.right_held)
 
         armed = self.armed
-        # cursor anchor = the index fingertip (the point the user aims with)
-        tx, ty = G.track_point(lms)
+        wall = time.time()                  # overlay visuals (pulse/sparkles) live on the wall clock
+        # cursor anchor = the index fingertip (the point the user aims with). 2.6: read
+        # the spike-gated but UNSMOOTHED tip; motion.py's noise-adaptive stage is the
+        # single smoothing stage on the aim path (it used to be smoothed twice).
+        gated = getattr(self.lmsm, "gated", None)
+        if gated is not None and len(gated) == len(lms):
+            tx, ty = gated[G.INDEX_TIP][0], gated[G.INDEX_TIP][1]
+        else:
+            tx, ty = G.track_point(lms)
         # 2.1 edge hold: landmark noise explodes as the hand starts leaving the
         # frame; inside the margin band the LAST stable aim point keeps driving
         # the cursor, so edge jitter never reaches the screen. The rest of the
@@ -1523,7 +996,7 @@ class Engine(threading.Thread):
                     self.motion.snap(ax, ay)     # land exactly on the anchor, then press
                     self._mouse_down("left")
                     bus.press = 0.75
-                    bus.pulse = (ax, ay, now)
+                    bus.pulse = (ax, ay, wall)
                     self.tel.event(now, "left_down")
                 elif ev == "left_up":
                     self._mouse_up("left")
@@ -1533,7 +1006,7 @@ class Engine(threading.Thread):
                     ax, ay = clicks.anchor or (sx, sy)
                     self.motion.snap(ax, ay)
                     self._mouse_click("right")
-                    bus.pulse = (ax, ay, now)
+                    bus.pulse = (ax, ay, wall)
                     self.tel.event(now, "right_click")
 
             # cursor motion only while pointing — scroll and idle freeze it
@@ -1541,7 +1014,7 @@ class Engine(threading.Thread):
                 cx, cy = clicks.cursor_target(now)   # anchor / drag ramp / live pos
                 self.motion.ingest(now, cx, cy)      # motion owns all output from here
                 if self._left_down and clicks.state == "drag" and cfg.get("sparkles", True):
-                    self._sparkle_burst(cx, cy, now)
+                    self._sparkle_burst(cx, cy, wall)
             else:
                 self.motion.halt()                   # clutch: freeze in place, no run-on
             if notches:
@@ -1565,11 +1038,8 @@ class Engine(threading.Thread):
         # them from here made the trail a 30 Hz staircase behind a smooth ring
         self._trail_on = bool(cfg["trail"] and armed and pose == "point")
 
-        # hide the OS arrow while the custom orb is live; restore otherwise
-        want_hidden = armed and cfg["cursor_style"] != "system"
-        if want_hidden != self._cursor_hidden:
-            wi.show_cursor(not want_hidden)
-            self._cursor_hidden = want_hidden
+        # the orb/ring becomes the pointer while armed; the OS cursor comes back otherwise
+        self._update_cursor_visual(armed and cfg["cursor_style"] != "system", cfg["cursor_style"])
 
     def _sparkle_burst(self, x, y, now):
         self._burst_acc += 1
@@ -1597,6 +1067,7 @@ class Engine(threading.Thread):
             self.bus.found = False
             self.bus.dim = True
             self.bus.press = 0.0
+        self._release_native()
         if self._cursor_hidden:
             wi.show_cursor(True)
             self._cursor_hidden = False
@@ -1617,64 +1088,36 @@ class Engine(threading.Thread):
     def _draw_preview(self, frame, res, cfg, now=None):
         """Preview modes: wireframe (hand skeleton only, default) | camera | off.
 
-        Draws on the PROCESSED frame (post downscale) so the preview shows
-        exactly what the tracker sees; encoded at ~12 fps max — the UI polls
-        the newest JPEG, so a slower preview costs nothing visually and saves
-        real CPU.
-        """
+        2.6: this only builds a cheap snapshot (frame reference + 21 points per hand);
+        the preview worker draws, JPEG-encodes and publishes it at <= PREVIEW_FPS."""
         mode = cfg.get("preview_mode", "wireframe")
         if mode == "off":
             return
-        now = now or time.time()
-        if now - self._preview_t < PREVIEW_MIN_INTERVAL:
+        t = time.perf_counter()
+        if t - self._preview_t < 1.0 / PREVIEW_FPS:
             return
-        self._preview_t = now
-        h, w = frame.shape[:2]
-        canvas = np.zeros_like(frame) if mode == "wireframe" else frame
-        lw = max(1, w // 320)
-        dot = max(2, w // 200)
-        if res.hand_landmarks:
-            for hi, hand in enumerate(res.hand_landmarks):
-                primary = (hi == self._active_hand)
-                pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand]
-                if primary and self._stable_lms is not None and len(self._stable_lms) == len(hand):
-                    pts = [(int(p[0] * w), int(p[1] * h)) for p in self._stable_lms]
-                color = SKY_BGR if primary else (110, 116, 128)
-                for a, b in HAND_CONNECTIONS:
-                    cv2.line(canvas, pts[a], pts[b], color, lw + 1 if primary else 1, cv2.LINE_AA)
-                for p in pts:
-                    cv2.circle(canvas, p, dot, WHITE_BGR if primary else color, -1, cv2.LINE_AA)
-                if primary:
-                    for a, b in ((4, 12), (4, 16)):  # thumb->middle / thumb->ring pinch links
-                        cv2.line(canvas, pts[a], pts[b], SKY_BGR, 1, cv2.LINE_AA)
-        ok, jpg = cv2.imencode(".jpg", canvas, PREVIEW_JPEG_QUALITY["jpg"])
-        if ok:
-            blob = jpg.tobytes()
-            self.bus.set_preview(blob)
-            if not self._pv_logged:
-                self._pv_logged = True
-                log.info("preview first frame (%s mode): %d bytes", mode, len(blob))
-        elif not self._pv_fail_logged:
-            self._pv_fail_logged = True
-            log.warning("preview encode failed")
+        self._preview_t = t
+        hands = [[(lm.x, lm.y) for lm in h] for h in (res.hand_landmarks or [])]
+        stable = ([(p[0], p[1]) for p in self._stable_lms] if self._stable_lms is not None else None)
+        self.preview.submit(mode, frame, hands, self._active_hand, stable)
+        if not self._pv_logged:
+            self._pv_logged = True
+            log.info("preview worker fed (%s mode)", mode)
 
-    def _publish_stats(self, t0, res):
-        dt = time.perf_counter() - t0
+    def _publish_stats(self, t_arrival, res):
+        # latency = camera-frame arrival -> tracking result applied (what the user feels,
+        # minus the camera/driver's own delay which we cannot see)
+        dt = time.perf_counter() - t_arrival
         bus = self.bus
-        # fps from a TIME window, not a frame-count gate. `bus.frames` counts
-        # PROCESSED frames, and the dup gate drops everything on a still scene —
-        # so the old "if frames % 15 == 0" never fired again and the UI chip sat
-        # at 0.0 forever on a perfectly healthy app (every run in handjob.log
-        # shows "beat frames=1 fps=0.0 ... found=True").
-        self._stat_n += 1
-        span = time.time() - self._stat_t
         with bus.lock:
             bus.frames += 1
             bus.latency_ms = bus.latency_ms * 0.9 + dt * 1000 * 0.1
-            if span >= 0.5:
-                bus.fps = self._stat_n / span
-                self._stat_n = 0
-                self._stat_t = time.time()
+            if bus.frames % 15 == 0:
+                now = time.time()
+                span = now - self.start_t
+                if span > 0:
+                    bus.fps = 15 / span
+                self.start_t = now
 
     # -- mouse helpers -------------------------------------------------------
     def _mouse_down(self, which):
@@ -1694,16 +1137,11 @@ class Engine(threading.Thread):
     def _emit_cursor(self, x, y):
         """CursorMotion sink (runs on the emitter thread): OS move + bus mirror.
 
-        Called only on whole-pixel changes, so this doubles as the deadzone.
-        `bus.position` is written WITHOUT bus.lock on purpose: this runs at the
-        emitter rate (144 Hz) and used to contend with the overlay's snapshot()
-        and the engine's _process_hand on every single move. A single attribute
-        rebind is atomic under the GIL — a reader either sees the old tuple or
-        the new one, never a torn value.
-        """
+        Called only on whole-pixel changes, so this doubles as the deadzone."""
         wi.move_absolute(x, y)
         bus = self.bus
-        bus.position = (x, y)
+        with bus.lock:
+            bus.position = (x, y)
         if self._trail_on:
             tn = time.time()
             if tn - self._trail_t >= 0.010 and math.dist((x, y), self._trail_last) >= 3.0:
@@ -1723,6 +1161,7 @@ class Engine(threading.Thread):
         pos = self.motion.position
         if pos is not None:
             self.motion.snap(pos[0], pos[1])
+        self._release_native()
         wi.show_cursor(True)
         self._cursor_hidden = False
 
@@ -1730,13 +1169,11 @@ class Engine(threading.Thread):
         try:
             if self._left_down:
                 self._mouse_up("left")
+            self._release_native()
             wi.show_cursor(True)
         except Exception:
             pass
-        try:
-            self.motion.stop()
-        except Exception:
-            pass
+        self._shutdown_camera_and_preview()
         try:
             if self.sonar is not None:
                 self.sonar.stop()
@@ -1744,20 +1181,10 @@ class Engine(threading.Thread):
         except Exception:
             pass
         try:
-            had_reader = self._reader is not None
-            self._stop_reader()          # never block app exit on a stuck driver
-            if self.capture is not None and not had_reader:
-                cap, self.capture = self.capture, None
-                threading.Thread(target=self._safe_release, args=(cap,), daemon=True).start()
+            if self.capture:
+                self.capture.release()
             if self.landmarker:
                 self.landmarker.close()
-        except Exception:
-            pass
-
-    @staticmethod
-    def _safe_release(cap) -> None:
-        try:
-            cap.release()
         except Exception:
             pass
 
