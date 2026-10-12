@@ -1697,6 +1697,61 @@ def test_open_mode_rejects_degenerate_driver_fallback():
         engmod.cv2 = real_cv2
 
 
+def test_auto_backend_is_the_accurate_engine():
+    """'the model got worse / wrong pose / freaking out' — the ONNX default.
+
+    The ONNX port runs the LITE landmark model and its error is pose-dependent,
+    not a fixed offset. Measured on the official test images:
+
+        thumb_up    : mediapipe 0.1px mean  |  onnx  6.1px mean (max 11.9px)
+        pointing_up : mediapipe 3.6px mean  |  onnx 31.2px mean (max 86.1px)
+
+    A displacement that grows with pose flips the pose classifier and lurches
+    the cursor — the exact reported symptom. 'auto' used to resolve to ONNX
+    whenever it could load, trading ~7 ms nobody needs (both fit the 16.7 ms
+    budget at 60 fps) for landmark accuracy. 'auto' must now mean MediaPipe;
+    'onnx' stays available as an explicit opt-in.
+    """
+    import handjob.engine as engmod
+    src = open(engmod.__file__, encoding="utf-8").read()
+    # auto must NOT reach the ONNX branch — only the explicit 'onnx' opt-in does
+    assert 'if backend == "onnx" and hands == 1 and not wants_custom:' in src, \
+        "'auto' still resolves to the ONNX backend"
+    assert 'if backend in ("auto", "onnx")' not in src, \
+        "'auto' is bundled with the explicit onnx opt-in again"
+    # the accurate engine is the fallback every path ends on
+    assert 'self._backend_name = "mediapipe"' in src
+
+
+def test_onnx_branch_feeds_bgr_not_rgb():
+    """The RGB/BGR swap that broke ONNX palm detection.
+
+    hand_onnx.detect_for_video documents: "the engine passes a mediapipe Image
+    wrapping an RGB numpy array; direct callers pass BGR arrays (like cv2.imread
+    output)". A raw ndarray is therefore read as BGR — but the engine's ONNX
+    branch passed the already-converted `rgb`, swapping red and blue on every
+    frame. Measured on the official test images:
+
+        fed BGR (correct)        -> 1 hand detected
+        fed RGB (what it passed) -> 0 hands detected
+
+    Total detection failure on a still image; in live video it degrades to
+    intermittent/wrong boxes, which reads as "wrong pose and freaking out".
+    """
+    import os
+    import handjob.engine as engmod
+    src = open(engmod.__file__, encoding="utf-8").read()
+    # the ONNX branch must hand over the BGR frame, never the converted rgb
+    assert "res = self.landmarker.detect_for_video(frame, ts_ms)" in src, \
+        "the ONNX branch no longer feeds the BGR frame"
+    assert "res = self.landmarker.detect_for_video(rgb, ts_ms)" not in src, \
+        "the ONNX branch is feeding channel-swapped RGB again"
+    # and the contract lives where the next reader will look for it
+    onnx_src = open(os.path.join(os.path.dirname(engmod.__file__), "hand_onnx.py"),
+                    encoding="utf-8").read()
+    assert "direct callers pass BGR arrays" in onnx_src
+
+
 def test_native_crash_forces_immediate_landmarker_rebuild():
     """An access violation inside detect_for_video leaves the C++ graph in an
     undefined state — it is NOT a transient error. Feeding that same corrupted

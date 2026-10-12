@@ -846,19 +846,33 @@ class Engine(threading.Thread):
     def _load_model(self):
         """Load the configured inference backend.
 
-        'auto'      — ONNX Runtime (DirectML GPU: ~0.6 ms/frame landmark stage
-                      vs ~7.5 ms MediaPipe CPU) when available; MediaPipe CPU
-                      is the always-present fallback.
-        'onnx'      — ONNX Runtime (still falls back to MediaPipe if it cannot
-                      start — a broken runtime must never brick the app).
-        'mediapipe' — the original CPU pipeline.
+        'auto'      — the ACCURATE engine: MediaPipe with the full bundled
+                      model. ONNX is deliberately NOT auto-selected (see below).
+        'onnx'      — ONNX Runtime (DirectML GPU, ~0.6 ms/frame). Falls back to
+                      MediaPipe if it cannot start — a broken runtime must never
+                      brick the app. OPT-IN: it runs the LITE landmark model, and
+                      the measured landmark error is pose-dependent, not a fixed
+                      offset — vs MediaPipe's full model on the same frames:
+
+                          thumb_up    : mediapipe 0.1px mean  |  onnx  6.1px mean
+                          pointing_up : mediapipe 3.6px mean  |  onnx 31.2px mean
+                                                                    (max 86px)
+
+                      A tens-of-pixels displacement that changes with pose is
+                      exactly what reads as "wrong pose / freaking out": the
+                      pose classifier flips and the cursor lurches. The speed
+                      win is real but unnecessary — MediaPipe's ~7.5 ms still
+                      fits the 16.7 ms budget at 60 fps.
+        'mediapipe' — the original CPU pipeline, explicit form.
 
         Custom .task models and 2-hand mode always use MediaPipe: the ONNX
         port covers the bundled lite model with one hand."""
         backend = str(settings.get("backend") or "auto")
         hands = int(settings.get("max_hands") or 1)
         wants_custom = bool(str(settings.get("model_file") or "").strip())
-        if backend in ("auto", "onnx") and hands == 1 and not wants_custom:
+        # 'onnx' ONLY: 'auto' must mean the accurate engine. Trading landmark
+        # accuracy for 7 ms nobody needs is how "the model got worse" happened.
+        if backend == "onnx" and hands == 1 and not wants_custom:
             try:
                 from .hand_onnx import OnnxHandLandmarker
                 palm = os.path.join(assets_dir(), "hand_onnx", "palm_detection_full.onnx")
@@ -1279,7 +1293,12 @@ class Engine(threading.Thread):
                         self._mp_image_cls(image_format=self._mp_image_fmt.SRGB, data=rgb),
                         ts_ms)
                 else:
-                    res = self.landmarker.detect_for_video(rgb, ts_ms)
+                    # ONNX takes a RAW array as BGR (see hand_onnx.detect_for_video:
+                    # "direct callers pass BGR arrays"). Passing `rgb` here swapped
+                    # red and blue on every frame — measured, palm detection went
+                    # from 1 hand to 0 on the official test images. `frame` is the
+                    # flipped BGR original, which is what this branch must feed.
+                    res = self.landmarker.detect_for_video(frame, ts_ms)
                 self._infer_ms = (time.perf_counter() - t_inf) * 1000.0
             except Exception:
                 consecutive_errors += 1

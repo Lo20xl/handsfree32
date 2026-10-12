@@ -420,11 +420,11 @@
       <div class="row" style="padding-top:13px">
         <div class="row-top"><label for="sel-backend">Inference engine</label></div>
         <select id="sel-backend">
-          <option value="auto">Auto — GPU when available</option>
-          <option value="onnx">GPU — ONNX / DirectML</option>
-          <option value="mediapipe">CPU — MediaPipe</option>
+          <option value="auto">Auto — most accurate</option>
+          <option value="onnx">GPU — ONNX / DirectML (fastest, less precise)</option>
+          <option value="mediapipe">CPU — MediaPipe (full model)</option>
         </select>
-        <div class="row-note">Auto runs the hand models on your GPU (~10× faster inference, much less CPU). Falls back to the CPU engine automatically. Switches live in about a second; custom models and 2-hand mode use the CPU engine.</div>
+        <div class="row-note">Auto uses MediaPipe's full model — the most accurate hand tracking here. The GPU engine is faster (~0.6 ms vs ~7.5 ms per frame) but runs the lighter model, and its landmark error grows with pose (measured: up to ~30 px off on some poses vs ~0.1 px for MediaPipe), which can read as jittery or wrong poses. Both fit comfortably at 60 fps; pick GPU only if you want the CPU load lower and can accept the drift.</div>
       </div>
       <div class="row" style="padding-top:13px">
         <div class="row-top"><label for="sel-res">Processing size</label></div>
