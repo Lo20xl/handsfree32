@@ -39,7 +39,9 @@ D_CUTOFF = 2.5      # Hz — velocity-estimate filter (slow enough to not chase 
 SPIKE_FRAC = 0.25   # max single-frame jump in palm-lengths at rest (dt-scaled)
 SPIKE_SPEED = 2.5   # extra budget = 2.5x current speed per frame — sustained
                     # motion self-authorizes; a teleport from rest stays tight
-PALM_GLITCH = 0.40  # palm length change per frame above this = tracker glitch
+PALM_GLITCH = 0.60  # palm length change vs the last ACCEPTED frame above this =
+                    # tracker glitch (held one frame). See the ponytail note in
+                    # process(): 40% fought real rotation; a depth inversion is 2-4x.
 
 
 def _alpha(dt: float, cutoff_hz: float) -> float:
@@ -69,6 +71,8 @@ class LandmarkStabilizer:
         self._v = None      # filtered velocities (units/s) [21][3]
         self._t = None
         self._rejects = 0   # diagnostics: frames rejected by the palm guard
+        self._held_last = False  # the previous frame was palm-guarded (hold once)
+        self._palm_ref = 0.0  # palm length of the last ACCEPTED frame
         self._pending = None  # (palm, time) of the last scale-rejected frame
 
     # ------------------------------------------------------------------ util
@@ -89,26 +93,29 @@ class LandmarkStabilizer:
             return list(lms)
         dt = min(0.25, now - self._t)
         self._t = now
-        # palm-scale guard: a big palm-length jump is a tracker z-flip, not a hand
+        # palm-scale guard: a big palm-length jump is a tracker glitch, not a hand.
+        # The reference is the palm of the last ACCEPTED frame (not the filtered
+        # landmarks, which lag and re-trigger the guard on the frame after every
+        # hold). A glitch is held for ONE frame; anything that persists is real
+        # motion — the hand rotated, leaned in, or the tracker re-locked at a new
+        # depth — and must be followed, because holding it froze the cursor solid
+        # while the hand kept moving.
+        #
+        # ponytail: PALM_GLITCH=0.60 is a deliberate ceiling. 40% was fighting
+        # real rotation (a fast flick changes the projected wrist->MCP length by
+        # ~cos of the yaw delta, so 50%+/frame is physically reachable) and
+        # dropping half the frames. Raise it if a real z-flip ever slips through;
+        # a genuine depth inversion changes length by 2-4x, well past this.
         palm_now = self._palm(lms)
-        palm_prev = self._palm(self._x)
         if palm_now < 0.02 or palm_now > 0.9:
             self._rejects += 1
             return [tuple(p) for p in self._x]
-        if abs(palm_now - palm_prev) > PALM_GLITCH * palm_prev:
-            # z-flip (one frame) vs a real change of apparent size. A glitch is
-            # gone next frame; a persistent change (hand leaned in/out, turned
-            # toward the camera) survives — re-seed onto it instead of holding
-            # the old frame forever (which froze the cursor permanently).
-            pend = self._pending
-            if pend is not None and abs(palm_now - pend[0]) <= PALM_GLITCH * pend[0]:
-                self._pending = None
-                self._seed(lms, now)
-                return list(lms)
-            self._pending = (palm_now, now)
+        if not self._held_last and abs(palm_now - self._palm_ref) > PALM_GLITCH * self._palm_ref:
+            self._held_last = True
             self._rejects += 1
             return [tuple(p) for p in self._x]
-        self._pending = None
+        self._held_last = False
+        self._palm_ref = palm_now
         a_d = _alpha(dt, self.d_cutoff)
         out = []
         for i in range(N_LMS):
@@ -119,7 +126,7 @@ class LandmarkStabilizer:
             # speed from PREVIOUS frames only — a teleport must not authorize
             # its own budget within the same frame
             speed = math.hypot(vx, vy)
-            budget = (self.spike_frac + SPIKE_SPEED * (speed / palm_prev) * dt) * palm_prev
+            budget = (self.spike_frac + SPIKE_SPEED * (speed / palm_now) * dt) * palm_now
             jx, jy = x - fx, y - fy
             jump = math.hypot(jx, jy)
             if jump > budget > 0:
@@ -133,7 +140,7 @@ class LandmarkStabilizer:
             vy += a_d * ((y - fy) / dt - vy)
             vz += a_d * ((z - fz) / dt - vz)
             # adaptive EMA: cutoff rises with speed -> no lag while moving
-            cutoff = self.min_cutoff + self.beta * (speed / palm_prev)
+            cutoff = self.min_cutoff + self.beta * (speed / palm_now)
             a = _alpha(dt, cutoff)
             fx += a * (x - fx)
             fy += a * (y - fy)
@@ -146,6 +153,8 @@ class LandmarkStabilizer:
     def _seed(self, lms, now: float) -> None:
         self._x = [[float(p[0]), float(p[1]), float(p[2])] for p in lms]
         self._v = [[0.0, 0.0, 0.0] for _ in range(N_LMS)]
+        self._held_last = False
+        self._palm_ref = self._palm(lms)
         self._t = now
 
 

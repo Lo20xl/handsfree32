@@ -1014,14 +1014,21 @@ def test_dup_frame_gate():
 
     frame = np.full((48, 64, 3), 90, dtype=np.uint8)
     frame[10:20, 10:30] = 200
-    sig_a = Engine._frame_sig(frame)
-    sig_b = Engine._frame_sig(frame.copy())
+    sig_a = Engine._frame_sig(frame)[0]
+    sig_b = Engine._frame_sig(frame.copy())[0]
     assert _is_dup_sig(sig_b, sig_a), "identical frames must classify as duplicates"
     assert not _is_dup_sig(sig_b, None), "no history -> never a duplicate"
     moved = frame.copy()
     moved[12:22, 12:32] = 220              # visible content change
-    assert not _is_dup_sig(Engine._frame_sig(moved), sig_a), \
+    assert not _is_dup_sig(Engine._frame_sig(moved)[0], sig_a), \
         "a changed frame must pass the gate"
+    # the signature also carries the frame brightness (black-frame watchdog).
+    # A uniform frame reports its exact value; a mixed frame reports the AREA
+    # average (the old code point-sampled every 16th pixel and could miss a
+    # bright region entirely, reading a lit frame as black).
+    assert Engine._frame_sig(np.full((8, 8, 3), 90, dtype=np.uint8))[1] == 90
+    assert Engine._frame_sig(np.zeros((8, 8, 3), np.uint8))[1] == 0
+    assert Engine._frame_sig(frame)[1] > 90, "a lit patch must raise the reported brightness"
 
     # wiring: the gate is used in the loop and resets on camera switches,
     # and only real cameras (we-opened captures) are gated
@@ -1610,11 +1617,166 @@ def test_camera_diagnostics_permanent():
     assert "self._last_frame_dark" in src
     # the black check must run ABOVE the dup gate, or repeated black frames
     # (the exact paused-vcam case) are skipped before it executes
-    assert src.index("dark_now = float") < src.index("_is_dup_sig(sig, self._last_proc_sig)")
+    assert src.index("dark_now = brightness") < src.index("_is_dup_sig(sig, self._last_proc_sig)")
     # 2.5.5: reopens must never drop a live feed — open-first swap + a working
     # (~10/s) feed must not trigger the repeat reopen
     assert "OPEN-FIRST swap" in src
     assert "urate < 6.0 and urate < 0.45 * rrate" in src
+
+
+def test_native_crash_forces_immediate_landmarker_rebuild():
+    """An access violation inside detect_for_video leaves the C++ graph in an
+    undefined state — it is NOT a transient error. Feeding that same corrupted
+    landmarker for 15 more frames (the old behaviour) is what turns one bad
+    frame into a hard crash, so the rebuild must happen on the FIRST failure.
+
+    Two halves: (a) the MediaPipe VIDEO-mode timestamp is forced strictly
+    increasing, because int(perf_counter()*1000) repeats whenever two frames
+    land in the same millisecond and a repeated timestamp drives the native
+    graph into exactly that undefined state; (b) the exception path calls
+    _rebuild_landmarker immediately."""
+    import handjob.engine as engmod
+    src = open(engmod.__file__, encoding="utf-8").read()
+    assert "if ts_ms <= self._last_ts_ms:" in src, "timestamp must be forced monotonic"
+    assert "self._last_ts_ms = ts_ms" in src
+    assert "if self._rebuild_landmarker():" in src, "rebuild on the first failure"
+    assert "consecutive_errors == 15" not in src, "the 15-strikes rebuild is gone"
+
+    # the rebuild helper really does close + reload, and reports failure honestly
+    class _Dead:
+        closed = False
+
+        def close(self):
+            _Dead.closed = True
+
+    class _Eng(engmod.Engine):
+        def __init__(self):
+            self.landmarker = _Dead()
+            self._loads = 0
+
+        def _load_model(self):
+            self._loads += 1
+            self.landmarker = _Dead() if self._loads > 1 else None
+
+    e = _Eng()
+    assert not e._rebuild_landmarker(), "a failed reload must report False"
+    assert _Dead.closed, "the old landmarker must be closed first"
+    e._loads = 1
+    assert e._rebuild_landmarker(), "a successful reload must report True"
+
+
+def test_fps_uses_a_time_window_not_a_frame_count():
+    """bus.frames counts PROCESSED frames and the dup gate drops everything on a
+    still scene, so the old 'if frames % 15 == 0' never fired again and the UI
+    chip sat at 0.0 forever on a healthy app. fps must come from a time window."""
+    import handjob.engine as engmod
+    src = open(engmod.__file__, encoding="utf-8").read()
+    assert "if span >= 0.5:" in src, "fps must refresh on a time window"
+    assert "bus.frames % 15" not in src, "the frame-count gate is gone"
+
+    bus = engmod.CursorBus()
+    eng = engmod.Engine(bus)
+    eng._publish_stats(__import__("time").perf_counter(), None)
+    eng._publish_stats(__import__("time").perf_counter(), None)
+    assert bus.frames == 2 and bus.fps == 0.0, "two frames in one window is not yet a rate"
+    eng._stat_t -= 1.0                       # pretend a second has passed
+    eng._publish_stats(__import__("time").perf_counter(), None)
+    assert bus.fps > 0.0, f"fps must update from the time window, got {bus.fps}"
+    assert eng._stat_n == 0, "the window counter must reset after publishing"
+
+
+def test_settings_save_is_serialised():
+    """Two writers (UI thread per slider tick, engine thread for cam_mode_cache)
+    used to interleave snapshot -> replace and silently lose an update; the
+    shared .tmp name made it worse. _save_lock now spans the whole critical
+    section and the temp name is per-writer."""
+    import handjob.settings as S
+    import os
+    import tempfile
+    import threading
+
+    path = os.path.join(tempfile.mkdtemp(), "settings.json")
+    S.save(path)                             # seeds the file
+    S.set("sensitivity", 0.31)
+    S.save(path)
+
+    # 40 concurrent writers, each committing a distinct value; the file must end
+    # up holding exactly one of them (never a torn/absent value)
+    errors = []
+
+    def w(v):
+        try:
+            for _ in range(20):
+                S.set("drag_px", v)
+                S.save(path)
+        except Exception as e:               # noqa: BLE001
+            errors.append(e)
+
+    ts = [threading.Thread(target=w, args=(v,)) for v in (7.0, 11.0, 19.0, 23.0)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert not errors, errors
+    assert os.path.exists(path), "the atomic replace must never leave the file missing"
+    import json
+    disk = json.load(open(path, encoding="utf-8"))
+    assert disk["drag_px"] in (7.0, 11.0, 19.0, 23.0), disk["drag_px"]
+    assert not [f for f in os.listdir(os.path.dirname(path)) if f.endswith(".tmp")], \
+        "temp files must be cleaned up"
+    S.reset()
+
+
+def test_landmark_stabilizer_holds_a_glitch_for_one_frame_only():
+    """A palm-scale jump is held for exactly ONE frame. A one-frame outlier is
+    noise (z-flip); anything that persists is real motion — the hand rotated,
+    leaned in, or the tracker re-locked at a new depth — and holding it froze
+    the cursor solid while the hand kept moving. An earlier attempt compared
+    against an EMA reference scale instead; that deadlocks on a true oscillation
+    (the reference never moves toward a level it keeps rejecting)."""
+    from handjob.lmsmooth import LandmarkStabilizer
+
+    def hand(palm, cx=0.5):
+        pts = [[cx, 0.5, 0.0] for _ in range(21)]
+        pts[9] = [cx + palm, 0.5, 0.0]
+        pts[8] = [cx + palm * 0.7, 0.5 - palm, 0.0]
+        return pts
+
+    # (a) a fast flick that changes projected length past the threshold every
+    # other frame must still be FOLLOWED, not frozen at one scale
+    st = LandmarkStabilizer()
+    t = 0.0
+    for _ in range(10):
+        t += 1 / 30.0
+        st.process(hand(0.2), t)
+    outs = []
+    for i in range(40):
+        t += 1 / 30.0
+        outs.append(st.process(hand(0.2 if i % 2 == 0 else 0.30), t)[8][0])
+    assert max(outs) - min(outs) > 0.03, \
+        f"a fast rotation must be followed (spread {max(outs)-min(outs):.3f})"
+
+    # (b) a one-frame z-flip is still rejected
+    st = LandmarkStabilizer()
+    t = 0.0
+    for _ in range(10):
+        t += 1 / 30.0
+        st.process(hand(0.2), t)
+    before = st.process(hand(0.2), t)[8][0]
+    flipped = st.process(hand(0.8), t + 1 / 30.0)[8][0]     # 4x palm = z-flip
+    assert abs(flipped - before) < 0.02, "a one-frame z-flip must still be held"
+
+    # (c) a real, gradual change of size is followed with at most one hold
+    st = LandmarkStabilizer()
+    t = 0.0
+    for _ in range(10):
+        t += 1 / 30.0
+        st.process(hand(0.2), t)
+    r0 = st._rejects
+    for i in range(10):
+        t += 1 / 30.0
+        out = st.process(hand(0.5), t)                       # new scale persists
+    assert st._rejects - r0 <= 1, "a persistent change may hold only one frame"
+    assert abs(out[8][0] - (0.5 + 0.5 * 0.7)) < 0.05, \
+        f"a real change of apparent size must be followed, got {out[8][0]:.3f}"
 
 
 def test_pred_lead_cap_and_box_smoothing():

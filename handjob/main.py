@@ -107,9 +107,18 @@ class Api:
 
     def get_state(self):
         bus = self.bus
+        # One local reference for the whole call: self.engine is only ever
+        # reassigned inside refresh_app, and reading it field-by-field while a
+        # refresh swaps it mid-dict is a torn-state race.
+        eng = self.engine
+        # cam_name MUST be resolved outside bus.lock: the first call after a
+        # refresh_app runs a full DirectShow/COM device enumeration (tens of ms),
+        # which used to block the engine's bus.position write and the overlay's
+        # snapshot() for the entire enumeration.
+        cam_name = eng._cam_device_name()
         with bus.lock:
             return {
-                "armed": self.engine.armed,
+                "armed": eng.armed,
                 "engine_started": self._engine_started,
                 "hand_found": bus.found,
                 "fps": round(bus.fps, 1),
@@ -120,19 +129,20 @@ class Api:
                 "settings": settings.get(),
                 "version": __version__,
                 "log_path": LOG_PATH,
-                "infer_ms": round(self.engine._infer_ms, 1),
-                "pose": self.engine._prev_pose,
+                "infer_ms": round(eng._infer_ms, 1),
+                "pose": eng._prev_pose,
                 "pinch_l": self._pinch()[0],
                 "pinch_r": self._pinch()[1],
                 "sonar": self._sonar_state(),
                 "cam_reads": bus.cam_reads,
                 "cam_unique": bus.cam_unique,
-                "backend": getattr(self.engine, "_backend_name", "mediapipe"),
-                "cam_name": self.engine._cam_device_name(),
+                "backend": getattr(eng, "_backend_name", "mediapipe"),
+                "cam_name": cam_name,
             }
 
     def _sonar_state(self):
         """Sonar diagnostics for the UI (experimental sensing channel)."""
+        from .sonar import CARRIER_MIN_DB
         eng = self.engine
         so = getattr(eng, "sonar", None)
         err = getattr(eng, "_sonar_last_error", None)
@@ -141,14 +151,22 @@ class Api:
             available = _sd is not None
         except Exception:
             available = False
-        out = {
-            "available": available,
-            "enabled": bool(settings.get("sonar_enabled")),
-            "diag": dict(getattr(so, "diag", {}) or {}),
-            "error": err if (err and so is None) else None,
-            "in_device": int(settings.get("sonar_in_device")),
-            "out_device": int(settings.get("sonar_out_device")),
-        }
+        diag = dict(getattr(so, "diag", {}) or {}) if so is not None else {}
+        # A tone the mic cannot hear is a hardware limit, not a fault — say so
+        # instead of showing "motion 0.00" forever, which reads as broken.
+        note = None
+        if so is not None and diag.get("blocks", 0) > 12 and not diag.get("carrier_ok", True):
+            note = (f"{diag.get('tone', 0):.0f} Hz tone not audible to this mic "
+                    f"(+{diag.get('carrier_db', 0):.0f} dB over floor, needs "
+                    f"+{CARRIER_MIN_DB:.0f}) — try another tone or audio device")
+        out = {"available": available,
+               "enabled": bool(settings.get("sonar_enabled")),
+               "diag": diag,
+               "carrier_ok": diag.get("carrier_ok"),
+               "note": note,
+               "error": err if (err and so is None) else None,
+               "in_device": int(settings.get("sonar_in_device")),
+               "out_device": int(settings.get("sonar_out_device"))}
         return out
 
     def _pinch(self):
@@ -316,11 +334,13 @@ class Api:
                     self.overlay.join(timeout=2.0)
             except Exception:
                 log.exception("refresh: overlay stop failed")
+            self._engine_started = False
             self.bus = CursorBus()
             self.overlay = Overlay(self.bus)
             self.overlay.start()
             self.engine = Engine(self.bus)
             self.engine.start()
+            self._engine_started = True
         log.info("refresh_app: backend restarted")
         return {"ok": True}
 
@@ -426,7 +446,7 @@ def run_probe(seconds=3.0):
     Writes 'PROBE OK' or 'PROBE FAIL <reason>' as the last line.
     """
     import time as _t
-    from .engine import CursorBus, Engine
+    from .engine import CursorBus, Engine, SONAR_BOOT_S
     from . import input_win32 as wi
 
     ok = []
@@ -461,6 +481,32 @@ def run_probe(seconds=3.0):
             raise RuntimeError("portaudio reports no audio devices")
         print(f"  sonar: sounddevice ok, {len(devs)} audio devices visible")
     check("sonar stack (sounddevice/portaudio)", sonar_stack)
+
+    # Actually START the sonar, not just import it: the stack check above passes
+    # in any session where the portaudio DLL is present, which says nothing about
+    # whether the tone output and analysis input can really open (sample-rate
+    # mismatch, a device held by another app, a driver in a bad state). Run it
+    # through the engine's own supervisor so the retry/backoff path is exercised
+    # too, then confirm blocks are actually being analysed.
+    def sonar_live():
+        from .sonar import Sonar
+        s = Sonar()
+        s.start_async().join(timeout=SONAR_BOOT_S)
+        if s.start_error:
+            raise RuntimeError(f"sonar would not start: {s.start_error}")
+        try:
+            deadline = time.time() + 3.0
+            while time.time() < deadline and s.diag.get("blocks", 0) < 5:
+                time.sleep(0.1)
+            d = dict(s.diag)
+            if d.get("blocks", 0) < 5:
+                raise RuntimeError(f"sonar opened but analysed no blocks ({d})")
+            print(f"  sonar: live — {d['blocks']} blocks @ {d.get('sr')} Hz, "
+                  f"tone {d.get('tone'):.0f} Hz, carrier +{d.get('carrier_db', 0):.0f} dB "
+                  f"over floor, motion {d.get('score', 0):.2f}")
+        finally:
+            s.stop()
+    check("sonar live start (tone out + analysis in)", sonar_live)
 
     # input round trip — read the cursor fresh each attempt and retry a few
     # times: the user may be moving the mouse or a fullscreen game may be

@@ -41,6 +41,10 @@ CROP_SIDE_SCALE = 2.6                # RectTransformation scale_x/scale_y
 CROP_SHIFT_Y = -0.5                  # RectTransformation shift_y
 MIN_PALM_SCALE = 0.1484375
 MAX_PALM_SCALE = 0.75
+RECT_MAX_AGE_S = 0.5            # a smoothed palm rect older than this is dropped
+                                # (a detection miss leaves the stale rect in place,
+                                # so a hand reappearing near the old spot must not
+                                # be EMA'd toward a position from seconds ago)
 STRIDES = (8, 16, 16, 16)
 ANCHOR_OFFSET = 0.5
 
@@ -255,9 +259,16 @@ class OnnxHandLandmarker:
         score, box, kps = det
         # keep the box steady across frames (2.5.6) — re-detecting every frame
         # made the landmark crop inherit the detector's pixel-level wander,
-        # which reads as whole-cursor jitter
+        # which reads as whole-cursor jitter.
+        #
+        # AGE-OUT: a detection miss returns early above WITHOUT touching
+        # _last_rect, so a rect from seconds ago stayed the EMA base and a hand
+        # reappearing near the old spot was dragged toward a stale position.
+        # A rect older than RECT_MAX_AGE_S is dropped instead.
         from .engine import _smooth_box
-        box, kps = _smooth_box(self._last_rect, box, kps)
+        if self._last_rect is not None and time.time() - self._last_rect[2] > RECT_MAX_AGE_S:
+            self._last_rect = None
+        box, kps = _smooth_box(self._last_rect[:2] if self._last_rect else None, box, kps)
         crop, m = self._crop(frame, box, kps)
         outs = self._landmark(crop)
         lm = outs[0][0].astype(np.float64)          # [63] crop-normalized 0..1
@@ -279,7 +290,7 @@ class OnnxHandLandmarker:
             # stabilizer sees a comparable magnitude across backends.
             z = lm[3 * k + 2] / 224.0
             pts.append(_Pt(x / w, y / h, z))
-        self._last_rect = (box, kps)
+        self._last_rect = (box, kps, time.time())
         world_lms = None
         if world is not None:
             world_lms = [_Pt(world[3 * k], world[3 * k + 1], world[3 * k + 2]) for k in range(21)]

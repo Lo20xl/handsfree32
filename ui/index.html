@@ -464,7 +464,7 @@
   </div>
 </main>
 
-<footer>HandJob3000 v<span id="fVer">2.5.6</span> — local only, nothing leaves your machine. Camera footage never leaves this app.</footer>
+<footer>HandJob3000 v<span id="fVer">2.5.7</span> — local only, nothing leaves your machine. Camera footage never leaves this app.</footer>
 
 <div class="overlay" id="telOverlay">
   <div class="dlg">
@@ -491,7 +491,8 @@ const DEFAULTS = {camera_index:0, sensitivity:0.6, smoothing:0.55, click_thresho
 /* ---- API: real pywebview bridge, or a mock for plain-browser preview ---- */
 const mock = {
   _st:{armed:false, engine_started:true, hand_found:false, fps:0, latency_ms:0, infer_ms:0,
-       error:null, cursor_style:"sky", settings:Object.assign({}, DEFAULTS), version:"2.5.6", sonar:null},
+       error:null, cursor_style:"sky", settings:Object.assign({}, DEFAULTS), version:"2.5.7",
+      sonar:{available:true, enabled:false, diag:{}, carrier_ok:null, note:null, error:null}},
   get_settings(){ return Promise.resolve(Object.assign({}, this._st.settings)); },
   set_setting(k,v){ this._st.settings[k]=v; return Promise.resolve({ok:true, settings:Object.assign({}, this._st.settings)}); },
   reset_settings(){ this._st.settings=Object.assign({}, DEFAULTS); return Promise.resolve({ok:true, settings:Object.assign({}, this._st.settings)}); },
@@ -627,7 +628,7 @@ function updateState(st){
   $("#stHand").dataset.tone = st.hand_found ? "good" : "warn";
   $("#kVers").textContent = st.version || "—";
   $("#kEng").textContent = st.engine_started ? "running" : "starting…";
-  $("#fVer").textContent = st.version || "2.5.6";
+  $("#fVer").textContent = st.version || "2.5.7";
   if (st.armed && st.hand_found) updateMeter(st.pinch_l, st.pinch_r, (st.settings && st.settings.click_threshold));
   updateSonarMeter(st.sonar, st.settings);
   if (st.settings && !dragging) applySettings(st.settings);
@@ -646,6 +647,15 @@ function updateSonarMeter(so, s){
   if (!so){ stats.textContent = "starting…"; note.textContent = "Warming up the tone emitter and mic…"; return; }
   if (so.error){ stats.textContent = "unavailable"; note.textContent = so.error; fill.style.width = "0%"; return; }
   if (so.available === false){ stats.textContent = "no audio stack"; note.textContent = "sounddevice is not available in this build/session."; return; }
+  // The tone is running but the mic cannot hear it: a hardware limit, not a
+  // fault. Say so plainly instead of leaving a permanent 0.00 that reads as
+  // "the sonar is broken".
+  if (so.note){
+    stats.textContent = "tone inaudible";
+    note.textContent = so.note;
+    fill.style.width = "0%"; fill.classList.remove("hot"); val.textContent = "—";
+    return;
+  }
   const d = so.diag || {};
   if (d.blocks != null && d.blocks === 0){ stats.textContent = "listening…"; note.textContent = "First analysis block takes ~0.1 s…"; }
   const score = (d.score != null) ? d.score : null;
@@ -851,7 +861,7 @@ async function init(){
     try { const st = await api().get_state(); armed = !!st.armed; updateState(st); }
     catch(e){}
   }, 700);
-  updateState({armed:false, engine_started:false, hand_found:false, fps:0, latency_ms:0, infer_ms:0, version:"2.5.6", settings:Object.assign({}, DEFAULTS)});
+  updateState({armed:false, engine_started:false, hand_found:false, fps:0, latency_ms:0, infer_ms:0, version:"2.5.7", settings:Object.assign({}, DEFAULTS)});
 }
 
 if (window.pywebview) init();

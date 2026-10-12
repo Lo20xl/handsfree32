@@ -71,6 +71,12 @@ CHOICES = {"cursor_style": ("sky", "glow", "system"),
            "sonar_tone": (17000, 19000, 21000)}
 
 _lock = threading.Lock()
+# Serialises the read-snapshot -> write -> replace critical section. Two
+# writers (UI thread on every slider tick, engine thread for cam_mode_cache)
+# used to interleave: A snapshots, B snapshots+B commits, B replaces, A
+# replaces -> B's change silently lost. A shared .tmp name made it worse
+# (both wrote the same temp file). Unique tmp + this lock = no lost update.
+_save_lock = threading.Lock()
 _data = dict(DEFAULTS)
 
 
@@ -133,12 +139,20 @@ def reset():
 
 
 def save(path=CONFIG_PATH):
-    with _lock:
-        snap = dict(_data)
-    tmp = path + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(snap, f, indent=2)
-        os.replace(tmp, path)
-    except Exception as e:
-        log.warning("settings save failed: %s", e)
+    """Atomic write. `_save_lock` is held across snapshot+replace so concurrent
+    callers can never interleave into a lost update; the tmp name carries the
+    pid/thread so a failed write can never clobber another writer's temp file."""
+    with _save_lock:
+        with _lock:
+            snap = dict(_data)
+        tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(snap, f, indent=2)
+            os.replace(tmp, path)
+        except Exception as e:
+            log.warning("settings save failed: %s", e)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass

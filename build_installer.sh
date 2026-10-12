@@ -56,7 +56,7 @@ else
   echo "INNO_MISSING - fallback to 7z SFX"
   SFX="/c/Users/tangy/scoop/apps/7zip/current/7z.sfx"
   "/c/Program Files/7-Zip/7z.exe" a -t7z -mx=5 build/HandJob3000.7z ./dist/HandJob3000/ 
-  cat "$SFX" build/sfx_config.txt build/HandJob3000.7z > dist-installer/HandJob3000-Setup-2.5.6.exe
-  .venv/Scripts/python.exe -c "d=open('dist-installer/HandJob3000-Setup-2.5.6.exe','rb').read(2); assert d==b'MZ', 'SFX header wrong!'; print('SFX_OK')"
+  cat "$SFX" build/sfx_config.txt build/HandJob3000.7z > dist-installer/HandJob3000-Setup-2.5.7.exe
+  .venv/Scripts/python.exe -c "d=open('dist-installer/HandJob3000-Setup-2.5.7.exe','rb').read(2); assert d==b'MZ', 'SFX header wrong!'; print('SFX_OK')"
 fi
 echo BUILD_SCRIPT_DONE

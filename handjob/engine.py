@@ -48,12 +48,26 @@ CAMERA_STALL_S = 4.0         # NO frames at all for this long -> the read is stu
 CAMERA_STALL_REOPENS = 3     # consecutive stall reopens before giving up (per ~minute)
 CAMERA_OPEN_DEADLINE_S = 12.0  # a wedged driver can hang VideoCapture() itself
 CAMERA_MIN_FPS = 12.0        # delivered fps below this = driver trickle mode
+SONAR_RETRY_S = 10.0         # sonar start failures back off this long before retrying
+                            # (a mic briefly held by another app must not disable
+                            # the sonar for the whole session)
+SONAR_BOOT_S = 2.0           # bounded wait for the sonar's PortAudio open
 FROZEN_UNIQUE_FPS = 2.0      # at/below this the source is frozen, not merely slow
 FROZEN_ERR = ("camera frozen — same frame repeating, ~0 new frames/s. Virtual cameras "
               "(NVIDIA Broadcast, Camo, OBS) do this when their source app is closed, "
               "PAUSED, or a phone is disconnected: pick a live camera in the Camera "
               "dropdown or fix the source (unpause / reconnect), then click Refresh app")
-SIG_EPS = 0.35                # 16x16 mean-abs diff at/below this = the same frame
+SIG_EPS = 0.35                # 16x16 mean-abs diff at/below this = the same frame.
+                              # ponytail: this is a ceiling, not a truth. Very
+                              # slow hand motion (a fingertip creeping <1 px/frame
+                              # in a dim room) can land under it and be gated as a
+                              # repeat — the unique-frame watchdog then reports a
+                              # low "new frames/s" and blames the camera. The 2.4.4
+                              # evidence tool (build/tune_repeats.py) sits at the
+                              # other end: too LOW and vcam repeats leak through
+                              # and inflate every dt. If tracking feels "held back"
+                              # on a slow feed, lower this before touching anything
+                              # downstream.
 
 # device names that identify a VIRTUAL camera chain (their frame source is a
 # separate app/phone we cannot see; "reads/s" then says nothing about liveness)
@@ -470,6 +484,7 @@ class Engine(threading.Thread):
         self._uniq_bad_streak = 0
         self._sig_ring = deque(maxlen=180)  # (t, 16x16 signature) of recent camera reads
         self._last_proc_sig = None      # signature of the last PROCESSED frame (dup gate)
+        self._last_ts_ms = 0            # last timestamp handed to detect_for_video (ms)
         self._read_count = 0            # raw reads (rate watchdog); bus.frames counts processed
         self._dedupe = False            # True when the capture is a real camera we opened
         self._uniq_reopened_cam = None  # one-chance repeat reopen per camera (see unique watchdog)
@@ -479,7 +494,8 @@ class Engine(threading.Thread):
         self._read_stalls = 0           # consecutive stall reopens (reset after a healthy minute)
         self._read_stall_t = 0.0
         self.sonar = None               # Sonar instance while enabled (experimental)
-        self._sonar_fail = None         # key that failed to start — no retry spam
+        self._sonar_fail = None         # key that failed to start — backs off, retries
+        self._sonar_retry_t = 0.0       # wall time of the last start attempt
         self._sonar_last_error = None
         # high-rate motion engine: this thread ingests camera-rate samples, the
         # CursorMotion emitter thread produces the 120-200 Hz absolute-move stream
@@ -504,6 +520,10 @@ class Engine(threading.Thread):
         self.tel = Telemetry()
         self._prev_pose = "idle"
         self._infer_ms = 0.0
+        # fps from a TIME window (see _publish_stats): the old "% 15 frames"
+        # gate never fired on a still scene, so the UI chip read 0.0 forever
+        self._stat_t = time.time()
+        self._stat_n = 0
 
     # -- public controls (thread-safe) ---------------------------------------
     def arm(self, on):
@@ -519,6 +539,14 @@ class Engine(threading.Thread):
 
     def stop(self):
         self._stop.set()
+        # Stop the emitter HERE, not only in _run's tail: refresh_app joins the
+        # engine thread with a 3 s timeout, and a camera-open still inside its
+        # 12 s _open_bounded deadline meant the OLD CursorMotion kept emitting
+        # absolute moves for seconds after the "restart" returned.
+        try:
+            self.motion.stop()
+        except Exception:
+            pass
 
     # -- lifecycle -----------------------------------------------------------
     def _open_camera(self, index, use_cache=True):
@@ -630,13 +658,26 @@ class Engine(threading.Thread):
 
     @staticmethod
     def _frame_sig(frame):
-        """Cheap fingerprint of a frame's content (16x16 gray, normalized)."""
+        """(signature, brightness) — cheap content fingerprint for the dup gate.
+
+        Returns the frame mean alongside the signature so the black-frame
+        watchdog stops paying for a second strided pass over the full frame
+        (measured: 0.014 ms/read saved, and it now reports a proper AREA
+        average instead of a point sample that could miss a bright region and
+        read a lit frame as black).
+
+        NOTE: gray-then-resize is the faster order here — measured 0.535 vs
+        0.584 ms/frame for resize-then-gray on a 720p frame, because the
+        full-resolution colour conversion is SIMD-optimised and the resize
+        dominates either way. Do not "optimise" the order back.
+        """
         g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         small = cv2.resize(g, (16, 16), interpolation=cv2.INTER_AREA).astype(np.int16)
-        return small - int(small.mean())
+        m = int(small.mean())
+        return small - m, m
 
     def _measure_unique_fps(self):
-        """reads/s and UNIQUE frames/s over the last ~2 s of camera reads.
+        """(reads/s, unique frames/s) over the last ~2 s of camera reads.
 
         Non-blocking: the loop feeds a cheap 16x16 signature per frame into
         `_sig_ring`; duplicates (virtual cams, low-light auto-exposure) show
@@ -644,11 +685,11 @@ class Engine(threading.Thread):
         exactly (noise/auto-gain), so identical == genuinely repeated."""
         ring = self._sig_ring
         if len(ring) < 10:
-            return None, None, None
+            return None, None
         t0, t1 = ring[0][0], ring[-1][0]
         span = t1 - t0
         if span < 0.8:
-            return None, None, None
+            return None, None
         reads = len(ring) / span
         uniq = 0
         prev = None
@@ -656,7 +697,7 @@ class Engine(threading.Thread):
             if prev is not None and not _is_dup_sig(sig, prev):
                 uniq += 1
             prev = sig
-        return reads, uniq / span, None
+        return reads, uniq / span
 
     def _open_with_retry(self, cam, attempts=15, use_cache=True):
         cap = None
@@ -808,6 +849,25 @@ class Engine(threading.Thread):
         log.info("inference backend: mediapipe (hands=%s%s)",
                  hands, ", custom model" if wants_custom else "")
 
+    def _rebuild_landmarker(self):
+        """Close + reload the landmarker. False when nothing usable loads.
+
+        The ONLY recovery from a native crash inside detect_for_video: an access
+        violation leaves the C++ graph in an undefined state, and the old code
+        kept feeding that same corrupted landmarker for up to 15 more failures.
+        """
+        try:
+            if self.landmarker is not None:
+                self.landmarker.close()
+        except Exception:
+            pass
+        try:
+            self._load_model()
+        except Exception:
+            log.exception("landmarker rebuild failed")
+            return False
+        return self.landmarker is not None
+
     def run(self):
         try:
             self._run()
@@ -944,21 +1004,21 @@ class Engine(threading.Thread):
             # filters, pose dwell, click timing, cursor velocity) works from this, not
             # from "after inference": inference time varies 10-30 ms frame to frame and
             # stamping after it injects that noise into every dt and velocity estimate.
-            # cheap content signature for the unique-frame watchdog + dup gate (non-blocking)
+            # cheap content signature for the unique-frame watchdog + dup gate
+            # (non-blocking) — also yields the frame brightness for free, so the
+            # black-frame watchdog no longer makes a second pass over the frame
             sig = None
+            dark_now = False
             try:
-                sig = self._frame_sig(frame)
+                sig, brightness = self._frame_sig(frame)
                 self._sig_ring.append((time.time(), sig))
+                dark_now = brightness < 2.0
             except Exception:
                 pass
             self._read_count += 1
             # black-frame watchdog: time-based and READ-based, so it also fires
             # when a camera repeats ONE black frame (the old per-processed-frame
             # counter never advanced for duplicates — this exact case was blind).
-            try:
-                dark_now = float(np.mean(frame[::16, ::16])) < 2.0
-            except Exception:
-                dark_now = False
             self._last_frame_dark = dark_now
             if dark_now:
                 if dark_since == 0.0:
@@ -997,7 +1057,7 @@ class Engine(threading.Thread):
             # the cursor then stutters at the unique rate. Detect + re-measure.
             if wnow - self._uniq_check_t >= 7.0:
                 self._uniq_check_t = wnow
-                rrate, urate, _ = self._measure_unique_fps()
+                rrate, urate = self._measure_unique_fps()
                 if rrate and urate is not None:
                     self.bus.cam_reads = round(rrate, 1)
                     self.bus.cam_unique = round(urate, 1)
@@ -1105,47 +1165,29 @@ class Engine(threading.Thread):
             hands = int(cfg.get("max_hands") or 1)
             if hands != self._hands_seen:
                 self._hands_seen = hands
-                try:
-                    self.landmarker.close()
-                except Exception:
-                    pass
-                try:
-                    self._load_model()
+                if self._rebuild_landmarker():
                     log.info("landmarker reloaded (num_hands=%s)", hands)
-                except Exception:
+                else:
                     log.exception("landmarker reload failed")
             # model change -> rebuild the landmarker on the new file (live switch;
             # a bad file falls back to the bundled default instead of dying)
             model_now = str(cfg.get("model_file") or "")
             if model_now != self._model_seen:
                 self._model_seen = model_now
-                try:
-                    self.landmarker.close()
-                except Exception:
-                    pass
-                try:
-                    self._load_model()
+                if self._rebuild_landmarker():
                     log.info("model switched -> %s", _task_base(model_now) or MODEL_NAME)
-                except Exception:
+                else:
                     log.exception("model switch failed — reverting to the bundled default")
                     settings.set("model_file", "")
                     self._model_seen = ""
-                    try:
-                        self._load_model()
-                    except Exception:
-                        log.exception("bundled model reload failed")
+                    self._rebuild_landmarker()
             # inference-backend change -> rebuild the landmarker on the other runtime
             backend_now = str(cfg.get("backend") or "auto")
             if backend_now != self._backend_seen:
                 self._backend_seen = backend_now
-                try:
-                    self.landmarker.close()
-                except Exception:
-                    pass
-                try:
-                    self._load_model()
+                if self._rebuild_landmarker():
                     log.info("inference backend switched -> %s", self._backend_name)
-                except Exception:
+                else:
                     log.exception("backend switch failed")
 
             # ------- duplicate-frame gate (virtual cams) ------------------------
@@ -1186,30 +1228,37 @@ class Engine(threading.Thread):
                 frame = cv2.flip(frame, 1)  # selfie view: hand right = screen right
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 t_inf = time.perf_counter()
+                # MediaPipe VIDEO mode requires a STRICTLY INCREASING timestamp.
+                # int(perf_counter()*1000) repeats whenever two frames land in the
+                # same millisecond, and a repeated/regressed timestamp drives the
+                # native graph into an undefined state — observed live as
+                # "OSError: access violation reading 0x10" inside
+                # detect_for_video. Bump by 1 ms rather than trust the clock.
+                ts_ms = int(t0 * 1000)
+                if ts_ms <= self._last_ts_ms:
+                    ts_ms = self._last_ts_ms + 1
+                self._last_ts_ms = ts_ms
                 if self._mp_image_cls is not None:
                     res = self.landmarker.detect_for_video(
                         self._mp_image_cls(image_format=self._mp_image_fmt.SRGB, data=rgb),
-                        int(t0 * 1000))
+                        ts_ms)
                 else:
-                    res = self.landmarker.detect_for_video(rgb, int(t0 * 1000))
+                    res = self.landmarker.detect_for_video(rgb, ts_ms)
                 self._infer_ms = (time.perf_counter() - t_inf) * 1000.0
             except Exception:
                 consecutive_errors += 1
-                log.exception("inference failed (%d consecutive)", consecutive_errors)
-                if consecutive_errors == 15:
-                    log.warning("recreating the landmarker after repeated inference errors")
-                    try:
-                        self.landmarker.close()
-                    except Exception:
-                        pass
-                    try:
-                        self._load_model()
-                        consecutive_errors = 0
-                        time.sleep(0.2)
-                        continue
-                    except Exception:
-                        log.exception("landmarker recreate failed")
-                if consecutive_errors > 45:
+                # A native exception (access violation / OSError from the C++
+                # graph) is NOT a transient error: the landmarker's internal
+                # state is now undefined, so feeding it more frames is exactly
+                # what turns one bad frame into a hard crash. Rebuild on the
+                # FIRST failure — the old code waited for 15.
+                log.exception("inference failed (%d consecutive) — rebuilding the landmarker",
+                              consecutive_errors)
+                if self._rebuild_landmarker():
+                    consecutive_errors = 0
+                    time.sleep(0.05)
+                    continue
+                if consecutive_errors > 8:
                     self.bus.error = "inference keeps failing — click Refresh app"
                     return
                 time.sleep(0.05)
@@ -1300,7 +1349,13 @@ class Engine(threading.Thread):
 
     # -- sonar supervision (experimental; never drives the cursor) -----------
     def _sync_sonar(self, cfg):
-        """Start/stop/restart the sonar sensing to match the settings."""
+        """Start/stop/restart the sonar sensing to match the settings.
+
+        Retries with backoff instead of latching: the old `_sonar_fail` key was
+        written on the FIRST failure and never cleared, so a mic that was
+        briefly busy at startup (another app, a device still waking) left the
+        sonar dead for the whole session until the user re-picked a device.
+        """
         want = bool(cfg.get("sonar_enabled"))
         key = (int(cfg.get("sonar_in_device", -1)), int(cfg.get("sonar_out_device", -1)),
                int(cfg.get("sonar_tone", 19000)))
@@ -1310,22 +1365,37 @@ class Engine(threading.Thread):
                 self.sonar = None
                 log.info("sonar stopped")
             self._sonar_fail = None
+            self._sonar_retry_t = 0.0
             return
         if self.sonar is not None and self.sonar.key != key:
             self.sonar.stop()
             self.sonar = None
-        if self.sonar is None and self._sonar_fail != key:
-            try:
-                from .sonar import Sonar
-                s = Sonar(in_dev=key[0], out_dev=key[1], tone=key[2])
-                s.start()
+        if self.sonar is None:
+            now = time.time()
+            if self._sonar_fail == key and now - self._sonar_retry_t < SONAR_RETRY_S:
+                return
+            self._sonar_retry_t = now
+            from .sonar import Sonar
+            s = Sonar(in_dev=key[0], out_dev=key[1], tone=key[2])
+            # start_async: opening two PortAudio streams can block for tens of
+            # ms, which used to stall the cursor loop mid-frame. The join is
+            # bounded (ms in the normal case) purely so the failure is visible
+            # to this frame instead of a later one.
+            s.start_async().join(timeout=SONAR_BOOT_S)
+            if s.start_error:
+                self._sonar_fail = key
+                self._sonar_last_error = s.start_error
+                # a dead instance must NOT stay in self.sonar or the retry
+                # branch above would never be reached again
+                s.stop()
+                self.sonar = None
+                log.warning("sonar unavailable (retrying in %ds): %s",
+                            SONAR_RETRY_S, s.start_error)
+            else:
                 self.sonar = s
+                self._sonar_fail = None
                 self._sonar_last_error = None
                 log.info("sonar started: %s", s.status())
-            except Exception as e:
-                self._sonar_fail = key
-                self._sonar_last_error = f"{type(e).__name__}: {e}"
-                log.warning("sonar unavailable: %s", self._sonar_last_error)
 
     # -- per-frame processing ------------------------------------------------
     def _process_hand(self, lms, mapper, clicks, scroll, cfg, now, frame, world=None):
@@ -1536,15 +1606,20 @@ class Engine(threading.Thread):
     def _publish_stats(self, t0, res):
         dt = time.perf_counter() - t0
         bus = self.bus
+        # fps from a TIME window, not a frame-count gate. `bus.frames` counts
+        # PROCESSED frames, and the dup gate drops everything on a still scene —
+        # so the old "if frames % 15 == 0" never fired again and the UI chip sat
+        # at 0.0 forever on a perfectly healthy app (every run in handjob.log
+        # shows "beat frames=1 fps=0.0 ... found=True").
+        self._stat_n += 1
+        span = time.time() - self._stat_t
         with bus.lock:
             bus.frames += 1
             bus.latency_ms = bus.latency_ms * 0.9 + dt * 1000 * 0.1
-            if bus.frames % 15 == 0:
-                now = time.time()
-                span = now - self.start_t
-                if span > 0:
-                    bus.fps = 15 / span
-                self.start_t = now
+            if span >= 0.5:
+                bus.fps = self._stat_n / span
+                self._stat_n = 0
+                self._stat_t = time.time()
 
     # -- mouse helpers -------------------------------------------------------
     def _mouse_down(self, which):
@@ -1564,11 +1639,16 @@ class Engine(threading.Thread):
     def _emit_cursor(self, x, y):
         """CursorMotion sink (runs on the emitter thread): OS move + bus mirror.
 
-        Called only on whole-pixel changes, so this doubles as the deadzone."""
+        Called only on whole-pixel changes, so this doubles as the deadzone.
+        `bus.position` is written WITHOUT bus.lock on purpose: this runs at the
+        emitter rate (144 Hz) and used to contend with the overlay's snapshot()
+        and the engine's _process_hand on every single move. A single attribute
+        rebind is atomic under the GIL — a reader either sees the old tuple or
+        the new one, never a torn value.
+        """
         wi.move_absolute(x, y)
         bus = self.bus
-        with bus.lock:
-            bus.position = (x, y)
+        bus.position = (x, y)
         if self._trail_on:
             tn = time.time()
             if tn - self._trail_t >= 0.010 and math.dist((x, y), self._trail_last) >= 3.0:
@@ -1596,6 +1676,10 @@ class Engine(threading.Thread):
             if self._left_down:
                 self._mouse_up("left")
             wi.show_cursor(True)
+        except Exception:
+            pass
+        try:
+            self.motion.stop()
         except Exception:
             pass
         try:
