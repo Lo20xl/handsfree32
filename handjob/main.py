@@ -673,6 +673,10 @@ def run_camprobe(index, w, h, fps, seconds):
     'CAMPROBE <fps>'. Spawned by the engine's camera probe so a driver-level
     crash (access violation) takes down the probe, not the app."""
     import cv2 as _cv2
+    # Mirrors engine.CAMERA_MIN_W/H. Duplicated rather than imported: this runs
+    # as a bare `--camprobe` subprocess where importing handjob.engine would
+    # pull in the model stack and defeat the point of the isolated probe.
+    _MIN_W, _MIN_H = 320, 240
     cap = None
     for backend in (_cv2.CAP_DSHOW, _cv2.CAP_ANY):
         try:
@@ -689,7 +693,21 @@ def run_camprobe(index, w, h, fps, seconds):
             cap.set(_cv2.CAP_PROP_FRAME_HEIGHT, int(h))
             cap.set(_cv2.CAP_PROP_FPS, int(fps))
             cap.set(_cv2.CAP_PROP_BUFFERSIZE, 1)
-            ok, _ = cap.read()
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                # The probe must judge the mode the driver ACTUALLY delivered: a
+                # held/degenerate stream answers full-rate with a tiny default
+                # frame (seen: 64x48), which would otherwise be blessed as a
+                # good mode and handed to the engine, where the hand is ~10 px
+                # of noise and the landmarks jump. Report the mismatch as a
+                # failure so the ladder moves on.
+                fh, fw = frame.shape[:2]
+                if fw < _MIN_W or fh < _MIN_H:
+                    print(f"CAMPROBE FAIL (delivered {fw}x{fh}, below {_MIN_W}x{_MIN_H})")
+                    cap.release()
+                    return 1
+                if (fw, fh) != (int(w), int(h)):
+                    print(f"CAMPROBE NOTE asked {w}x{h} delivered {fw}x{fh}")
             if not ok:
                 cap.release()
                 cap = None

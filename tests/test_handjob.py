@@ -1624,6 +1624,79 @@ def test_camera_diagnostics_permanent():
     assert "urate < 6.0 and urate < 0.45 * rrate" in src
 
 
+def test_open_mode_rejects_degenerate_driver_fallback():
+    """The 'smooth but jumps everywhere' root cause.
+
+    Drivers ignore CAP_PROP_FRAME_WIDTH/HEIGHT and fall back to their own
+    default — measured live: asking cam0 for 640x480 returned 1280x720, and in
+    the field a held stream returned 64x48. _open_mode used to accept ANY frame
+    that arrived, so a 48px frame reached MediaPipe (the engine only downscales
+    when proc_h < frame height), where a hand is ~10 px of noise: the landmarks
+    jump, the 1e filter smooths BETWEEN the jumps, and _cam_mode recorded the
+    size we ASKED for so every watchdog decided on a lie.
+    """
+    import numpy as np
+    import handjob.engine as engmod
+
+    def fake_capture(size):
+        class Cap:
+            def __init__(self):
+                self.released = False
+                self.props = {}
+            def isOpened(self):
+                return True
+            def set(self, prop, value):
+                self.props[prop] = value
+                return True
+            def read(self):
+                h, w = size
+                return True, np.zeros((h, w, 3), np.uint8)
+            def release(self):
+                self.released = True
+        return Cap()
+
+    opened = []
+
+    class FakeCV2:
+        CAP_DSHOW = 700
+        CAP_ANY = 0
+        CAP_PROP_FOURCC = 6
+        CAP_PROP_FRAME_WIDTH = 3
+        CAP_PROP_FRAME_HEIGHT = 4
+        CAP_PROP_FPS = 5
+        CAP_PROP_BUFFERSIZE = 38
+
+        @staticmethod
+        def VideoCapture(index, backend):
+            opened.append(index)
+            return fake_capture(size)
+
+        @staticmethod
+        def VideoWriter_fourcc(*a):
+            return 0
+
+    real_cv2 = engmod.cv2
+    engmod.cv2 = FakeCV2
+    try:
+        # a 64x48 fallback must be REJECTED, not accepted as a good mode
+        size = (48, 64)
+        assert engmod.Engine._open_mode(0, 640, 480, 60) is None, \
+            "a 64x48 driver fallback was accepted as a usable mode"
+
+        # a correct-size frame is accepted and reports what was delivered
+        size = (480, 640)
+        res = engmod.Engine._open_mode(0, 640, 480, 60)
+        assert res is not None and res[1] == (640, 480), res
+
+        # LARGER than requested is fine — the engine downscales in software
+        size = (720, 1280)
+        res = engmod.Engine._open_mode(0, 640, 480, 60)
+        assert res is not None and res[1] == (1280, 720), \
+            "an oversized delivery should be accepted, not rejected"
+    finally:
+        engmod.cv2 = real_cv2
+
+
 def test_native_crash_forces_immediate_landmarker_rebuild():
     """An access violation inside detect_for_video leaves the C++ graph in an
     undefined state — it is NOT a transient error. Feeding that same corrupted

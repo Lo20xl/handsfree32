@@ -48,6 +48,7 @@ CAMERA_STALL_S = 4.0         # NO frames at all for this long -> the read is stu
 CAMERA_STALL_REOPENS = 3     # consecutive stall reopens before giving up (per ~minute)
 CAMERA_OPEN_DEADLINE_S = 12.0  # a wedged driver can hang VideoCapture() itself
 CAMERA_MIN_FPS = 12.0        # delivered fps below this = driver trickle mode
+CAMERA_MIN_W, CAMERA_MIN_H = 320, 240  # below this a hand is unresolvable: reject the mode
 SONAR_RETRY_S = 10.0         # sonar start failures back off this long before retrying
                             # (a mic briefly held by another app must not disable
                             # the sonar for the whole session)
@@ -573,9 +574,10 @@ class Engine(threading.Thread):
                 except (TypeError, ValueError):
                     w = h = 0
                 if w > 0 and h > 0:
-                    cap = self._open_mode(index, w, h, fps)
-                    if cap is not None:
-                        self._cam_mode = (w, h)
+                    opened = self._open_mode(index, w, h, fps)
+                    if opened is not None:
+                        cap, delivered = opened
+                        self._cam_mode = delivered
                         log.info("camera %s: using saved mode %sx%s", index, w, h)
                         return cap
         order = [(CAPTURE_W, CAPTURE_H), (640, 480)]
@@ -589,10 +591,13 @@ class Engine(threading.Thread):
                     log.warning("camera %s: even 640x480 delivers only %.1f fps", index, measured)
                 elif (w, h) != (CAPTURE_W, CAPTURE_H):
                     log.info("camera %s: 720p delivered %.1f fps -> fell back to 640x480", index, measured)
-                cap = self._open_mode(index, w, h, fps)
+                cap = None
+                opened = self._open_mode(index, w, h, fps)
+                if opened is not None:
+                    cap, delivered = opened
                 if cap is None:
                     continue
-                self._cam_mode = (w, h)
+                self._cam_mode = delivered
                 try:
                     cache = settings.get("cam_mode_cache") or {}
                     cache[str(int(index))] = [int(w), int(h)]
@@ -633,7 +638,24 @@ class Engine(threading.Thread):
 
     @staticmethod
     def _open_mode(index, w, h, fps):
-        """Open one (backend, resolution) attempt; None when it can't deliver a frame."""
+        """Open one (backend, resolution) attempt; None when it can't deliver a frame.
+
+        VERIFIES THE DELIVERED SIZE, not just that a frame arrived. Drivers
+        routinely ignore CAP_PROP_FRAME_WIDTH/HEIGHT and fall back to their own
+        default — measured live: asking cam0 for 640x480 returned 1280x720, and
+        in the field a held/degenerate stream returned 64x48. Accepting that
+        silently is what makes the hand landmarks jump: the engine only
+        downscales when proc_h < frame height, so a 48px frame reaches
+        MediaPipe untouched, where a hand is ~10 pixels of noise. The 1e filter
+        then smooths the path BETWEEN those jumps — "smooth but jumps
+        everywhere" — and _cam_mode still records the size we ASKED for, so
+        every watchdog that compares it against a rung decides on a lie.
+
+        A frame LARGER than requested is fine (the engine shrinks it in
+        software); only a degenerate fallback is rejected. Returns
+        (capture, (delivered_w, delivered_h)) so the caller records what the
+        driver ACTUALLY gave us, or None.
+        """
         for backend in (cv2.CAP_DSHOW, cv2.CAP_ANY):
             try:
                 cap = cv2.VideoCapture(index, backend)
@@ -641,16 +663,30 @@ class Engine(threading.Thread):
                     cap.release()
                     continue
                 try:
-                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc("MJPG"))
                 except Exception:
                     pass
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
                 cap.set(cv2.CAP_PROP_FPS, fps)
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                ok, _ = cap.read()
-                if ok:
-                    return cap
+                ok, frame = cap.read()
+                if ok and frame is not None:
+                    fh, fw = frame.shape[:2]
+                    if fw < CAMERA_MIN_W or fh < CAMERA_MIN_H:
+                        log.warning(
+                            "camera %s: asked for %sx%s but the driver delivered "
+                            "%sx%s (below %sx%s) — rejecting the mode, another app "
+                            "is likely holding the camera", index, w, h, fw, fh,
+                            CAMERA_MIN_W, CAMERA_MIN_H)
+                        cap.release()
+                        return None
+                    if (fw, fh) != (w, h):
+                        log.info("camera %s: asked %sx%s, driver delivered %sx%s%s",
+                                 index, w, h, fw, fh,
+                                 " (larger than asked — engine downscales)"
+                                 if fw * fh > w * h else "")
+                    return cap, (fw, fh)
                 cap.release()
             except Exception:
                 continue
